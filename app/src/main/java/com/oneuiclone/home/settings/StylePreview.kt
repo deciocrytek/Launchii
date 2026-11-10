@@ -298,6 +298,7 @@ class StylePreview(private val activity: Activity) {
         root.addView(search, FrameLayout.LayoutParams(search.pillWidth, search.pillHeight).apply {
             topMargin = dp.indicatorRect.top + (dp.indicatorRect.height() - search.pillHeight) / 2
         })
+        if (Prefs(activity).hideSearchRow) { indicator.visibility = View.INVISIBLE; search.visibility = View.INVISIBLE }
 
         root.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY))
         root.layout(0, 0, width, height)

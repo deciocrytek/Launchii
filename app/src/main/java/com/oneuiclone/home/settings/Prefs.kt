@@ -32,6 +32,8 @@ class Prefs(context: Context) {
      * screen (overrides [swipeDownNotifications] and [swipeUpSearch]); off by default.
      */
     var swipeDownSearch: Boolean get() = sp.getBoolean("swipe_down_search", false); set(v) = sp.edit().putBoolean("swipe_down_search", v).apply()
+    /** Home shows no Search button and no page dots (their row stays empty); search then fades in rather than grow out of the button. */
+    var hideSearchRow: Boolean get() = sp.getBoolean("hide_search_row", false); set(v) = sp.edit().putBoolean("hide_search_row", v).apply()
     var lockLayout: Boolean get() = sp.getBoolean("lock_layout", false); set(v) = sp.edit().putBoolean("lock_layout", v).apply()
     var addNewApps: Boolean get() = sp.getBoolean("add_new_apps", false); set(v) = sp.edit().putBoolean("add_new_apps", v).apply()
     var themedIcons: Boolean get() = sp.getBoolean("themed_icons", false); set(v) = sp.edit().putBoolean("themed_icons", v).apply()

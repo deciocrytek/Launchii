@@ -117,6 +117,8 @@ class AppsSearch(
         val glass: WidgetGlass? = null,
         /** The pill's hint and glyph colour; null for the bar's own. */
         val ink: Int? = null,
+        /** The pill isn't on screen: the bar stays where it rests and fades with the results instead of morphing. */
+        val fade: Boolean = false,
     )
 
     private val field = EditText(context)
@@ -147,6 +149,8 @@ class AppsSearch(
     /** The result IME "go" opens. */
     private var enterTarget: View? = null
     private lateinit var origin: Origin
+    /** The bar carries a blur ([layoutPill], a fading bar in Lift-Off). */
+    private var pillBlurred = false
     /** Glass drawn under the pill's fill while it morphs ([Origin.glass]). */
     private var pillGlass: WidgetGlass? = null
 
@@ -740,11 +744,11 @@ class AppsSearch(
         val o = origin
         val r = o.rect
         // Lift-Off: it reads as the bar early on (size and colour lead), while its height follows the finger
-        val g = if (isLifting) 1f - (1f - minOf(1f, f * 1.12f)).pow(2.2f) else f
+        val g = if (o.fade) 1f else if (isLifting) 1f - (1f - minOf(1f, f * 1.12f)).pow(2.2f) else f
         val h = lerp(r.height(), dp.searchBarHeight.toFloat(), g)
         val margin = dp.dp(16f)
         val w = lerp(r.width(), dp.widthPx - 2 * margin, g)
-        val own = lerp(r.top, barTop(kb, dp.searchBarHeight.toFloat()), f)
+        val own = lerp(r.top, barTop(kb, dp.searchBarHeight.toFloat()), if (o.fade) 1f else f)
         // whichever is higher: the bar's own motion, or the keyboard pushing it up (never behind the keyboard)
         val top = if (ime > 0) minOf(own, barTop(ime.toFloat(), h)) else own
         val lp = pill.layoutParams
@@ -753,7 +757,17 @@ class AppsSearch(
             pill.layoutParams = lp
         }
         pill.x = lerp(r.left, margin, g)
-        pill.y = top - barBounce
+        // a fading bar comes and goes with the results: in Lift-Off it rises (or drops), grows, sharpens and fades in
+        // exactly as they do; otherwise it fades with the morph's progress
+        val q = if (o.fade && isLifting) liftFocus(f) else 1f
+        pill.y = top - barBounce + dp.dp(LIFT_RISE_DP) * (1f - q) * liftSign
+        pill.alpha = if (!o.fade) 1f else if (isLifting) liftFade(f) else f
+        val sc = 0.92f + 0.08f * q
+        pill.scaleX = sc; pill.scaleY = sc
+        val blur = if (liftBlurs) dp.dp(LIFT_BLUR_DP) * (1f - q) else 0f
+        // DECAL: past the pill's edge the blur fades to nothing (CLAMP smeared its edges out into a rectangle around it)
+        if (blur >= 0.5f) { pill.setRenderEffect(RenderEffect.createBlurEffect(blur, blur, Shader.TileMode.DECAL)); pillBlurred = true }
+        else if (pillBlurred) { pill.setRenderEffect(null); pillBlurred = false }
         pillBg.cornerRadius = h / 2f
         pillBg.setColor(argb.evaluate(g, o.fill, colors.open) as Int)
         pillBg.setStroke(dp.dpi(1f), argb.evaluate(g, o.stroke, colors.stroke) as Int)
@@ -762,7 +776,8 @@ class AppsSearch(
         val ink = argb.evaluate(g, o.ink ?: colors.hint, colors.hint) as Int
         glyph.color = ink
         field.setHintTextColor(ink)
-        pill.elevation = lerp(o.elevation, dp.dp(8f), g)              // search_bar_elevation
+        // search_bar_elevation; a fading bar's shadow (drawn sharp, never blurred) comes in only as the bar sharpens
+        pill.elevation = lerp(o.elevation, dp.dp(8f), g) * q
         val gs = lerp(o.glyphBox, openGlyphBox, g) / openGlyphBox
         glyph.scaleX = gs; glyph.scaleY = gs
         glyph.translationX = lerp(o.glyphLeft, openGlyphLeft, g) - openGlyphLeft
@@ -818,9 +833,10 @@ class AppsSearch(
         // everything at once: a fade and a slide (up, or down after a swipe down), with the bar's morph
         content.alpha = 0f
         content.translationY = dp.dp(OPEN_RISE_DP) * if (fromAbove) -1f else 1f
-        content.animate().alpha(1f).translationY(0f).setDuration(OPEN_MS).setInterpolator(Easing.IME).start()
-        animateTo(1f)
-        field.isCursorVisible = true
+        content.animate().alpha(1f).translationY(0f).setDuration(OPEN_MS).setInterpolator(Easing.IME)
+            .withEndAction { showCursor() }.start()
+        animateTo(1f) { showCursor() }
+        field.isCursorVisible = false
         field.requestFocus()
         keyboardComing = false
         askForKeyboard()
@@ -918,7 +934,7 @@ class AppsSearch(
         opening = false
         content.animate().cancel()
         setLift(0f)
-        field.isCursorVisible = true
+        field.isCursorVisible = false
         field.requestFocus()
         keyboardComing = false
         imeTries = 0
@@ -946,17 +962,23 @@ class AppsSearch(
         f = p.coerceIn(0f, 1f)
         layoutPill()
         // the results grow out of the bar from 92%, rise 38 dp (or drop) and come into focus over the last 90%
-        val q = Easing.SINE_IN_OUT_80.getInterpolation(((p - 0.1f) / 0.9f).coerceIn(0f, 1f))
+        val q = liftFocus(p)
         content.pivotX = dp.widthPx / 2f
         content.pivotY = barTop(kbTarget, dp.searchBarHeight.toFloat()) + dp.searchBarHeight / 2f - (content.layoutParams as LayoutParams).topMargin
         val sc = 0.92f + 0.08f * q
         content.scaleX = sc; content.scaleY = sc
         content.translationY = dp.dp(LIFT_RISE_DP) * (1f - q) * liftSign
-        content.alpha = (q / 0.8f).coerceAtMost(1f)
+        content.alpha = liftFade(p)
         val r = if (liftBlurs) dp.dp(LIFT_BLUR_DP) * (1f - q) else 0f
         content.setRenderEffect(if (r < 0.5f) null else RenderEffect.createBlurEffect(r, r, Shader.TileMode.CLAMP))
         steerKeyboard(p)
     }
+
+    /** How far into focus the results are at lift [p]: from 10 % on, eased. */
+    private fun liftFocus(p: Float) = Easing.SINE_IN_OUT_80.getInterpolation(((p - 0.1f) / 0.9f).coerceIn(0f, 1f))
+
+    /** The results' opacity at lift [p] (a fading bar's too): fully in by 80 % focus. */
+    private fun liftFade(p: Float) = (liftFocus(p) / 0.8f).coerceAtMost(1f)
 
     /** Lift-Off settled: [open] leaves search up (keyboard and all), otherwise it is gone and [onClose] runs. */
     fun endLift(open: Boolean) {
@@ -970,6 +992,7 @@ class AppsSearch(
             if (c != null) c.finish(true)
             else { imeCancel?.cancel(); askForKeyboard() }          // never got hold of it: it comes up on its own
             main.postDelayed(noKeyboard, 2500)
+            showCursor()
             return
         }
         dropLift()
@@ -984,7 +1007,9 @@ class AppsSearch(
      */
     fun bounceBar(amount: Float) {
         bounceAnim?.cancel()
-        if (amount < 0.5f || !isOpen) return
+        // a fading bar never travelled, so it has nothing to land from
+        if (amount < 0.5f || !isOpen || (::origin.isInitialized && origin.fade)) return
+        field.isCursorVisible = false
         bounceAnim = ValueAnimator.ofFloat(0f, BOUNCE_S).apply {
             duration = (BOUNCE_S * 1000).toLong()
             interpolator = LinearInterpolator()
@@ -994,10 +1019,17 @@ class AppsSearch(
                 layoutPill()
             }
             addListener(object : AnimatorListenerAdapter() {
-                override fun onAnimationEnd(animation: Animator) { barBounce = 0f; layoutPill() }
+                override fun onAnimationEnd(animation: Animator) { barBounce = 0f; layoutPill(); showCursor() }
             })
             start()
         }
+    }
+
+    /** The typing cursor, once the bar has stopped moving (morph, results, lift and landing bounce all done). */
+    private fun showCursor() {
+        if (!isOpen || isLifting || anim?.isRunning == true || bounceAnim?.isRunning == true) return
+        if (content.alpha < 1f) return                               // the results are still coming in
+        field.isCursorVisible = true
     }
 
     /** Lets go of a lift part-way (a held keyboard goes back down). */

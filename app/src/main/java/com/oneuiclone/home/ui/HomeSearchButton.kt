@@ -128,9 +128,9 @@ class HomeSearchButton(
     }
 
     /** The pill as the search bar's start / end state; [left]/[top] are root coordinates at rest. */
-    fun origin(left: Float, top: Float) = AppsSearch.Origin(
+    fun origin(left: Float, top: Float, fade: Boolean = false) = AppsSearch.Origin(
         RectF(left, top, left + pillWidth, top + pillHeight), fill.color, border.color, 0f,
-        glyphLeft, glyphBox, textStart, text.textSize, glass, if (glass != null) text.color else null,
+        glyphLeft, glyphBox, textStart, text.textSize, glass, if (glass != null) text.color else null, fade,
     )
 
     override fun onDraw(canvas: Canvas) {

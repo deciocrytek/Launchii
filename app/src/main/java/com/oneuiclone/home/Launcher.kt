@@ -256,7 +256,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         { deletePage(it) },
         {
             if (!::homeSearch.isInitialized) emptyList()
-            else listOfNotNull(homeSearch, updatePill.takeIf { AppUpdate.available != null })
+            else listOfNotNull(homeSearch.takeIf { !searchRowHidden }, updatePill.takeIf { AppUpdate.available != null })
         },
     )
 
@@ -428,6 +428,9 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         indicator.leadingGapPx = dp.dp(6f)
         indicator.leadingPx = homeSearch.pillWidth.toFloat()
         indicator.onLeadingMoved = { x -> homeSearch.translationX = x; placeUpdatePill() }
+        // Hide search bar and page indicators: both stay laid out (search still takes its origin from the button), unseen
+        searchRowHidden = prefs.hideSearchRow
+        if (searchRowHidden) { indicator.visibility = View.INVISIBLE; homeSearch.visibility = View.INVISIBLE }
         AppUpdate.onChanged = { syncUpdatePill() }
         syncUpdatePill()
         hotseat = CellLayout(activity, 5, 1)
@@ -2056,7 +2059,9 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             !activity.getSystemService(android.app.KeyguardManager::class.java).isKeyguardLocked
 
     private fun placeUpdatePill() {
-        updatePill.translationX = homeSearch.translationX - dp.dp(6f) - updatePill.layoutParams.width
+        // with the Search button hidden the pill has the row to itself: centred
+        updatePill.translationX = if (searchRowHidden) (dp.widthPx - updatePill.layoutParams.width) / 2f
+            else homeSearch.translationX - dp.dp(6f) - updatePill.layoutParams.width
     }
 
     /** The pill as [AppUpdate] stands: hidden with nothing newer, else Update / 42 % / Installing / Retry. */
@@ -2601,10 +2606,13 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
     private var search: com.oneuiclone.home.ui.AppsSearch? = null
     /** Opened from the Home screen Search button: closing goes back Home, into that button. */
     private var searchFromHome = false
+    /** Hide search bar and page indicators is on (read when Home is built). */
+    private var searchRowHidden = false
 
     /** Origins in root coordinates from layout positions, so they're right even mid-transition. */
     private fun drawerSearchOrigin() = searchPill.origin(searchPill.left.toFloat(), searchPill.top.toFloat())
-    private fun homeSearchOrigin() = homeSearch.origin(homeSearch.left + homeSearch.translationX, homeSearch.top.toFloat())
+    /** With the button hidden ([searchRowHidden]) the bar doesn't grow out of it: it fades in and out in place. */
+    private fun homeSearchOrigin() = homeSearch.origin(homeSearch.left + homeSearch.translationX, homeSearch.top.toFloat(), fade = searchRowHidden)
 
     /**
      * The bar grows out of the pill that was tapped. From Home, the screen crossfades to the Apps screen's
@@ -2640,7 +2648,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         ) {
             // the bar has landed exactly on its pill: swap them in the same frame
             searchPill.visibility = View.VISIBLE
-            homeSearch.visibility = View.VISIBLE
+            if (!searchRowHidden) homeSearch.visibility = View.VISIBLE
             removeSearch(s)
             if (search === s) search = null
             if (state.state == StateController.State.HOME && !state.isTransitioning) restoreAppsChrome()

@@ -77,6 +77,7 @@ class SettingsActivity : OneUiPage() {
             item("Icons", "Icon shape, theme, size and labels") {
                 startActivity(Intent(this@SettingsActivity, IconThemeActivity::class.java))
             }
+            toggle("Hide search bar and page indicators", "Remove the Search button and page dots from the Home screen.", prefs.hideSearchRow) { prefs.hideSearchRow = it }
             toggle("Pop-up folders", "Open folders in a small window over the Home screen instead of full screen.", prefs.popupFolders) { prefs.popupFolders = it }
             val bubblesMissing = AppBubbles.missing(this@SettingsActivity)
             toggle("App bubbles", if (prefs.appBubbles && bubblesMissing != null) bubblesMissing
