@@ -10,6 +10,7 @@ class Prefs(context: Context) {
     // whatever reads the settings first (Home, a widget, a settings page) sets the icon shape for this process
     init { com.oneuiclone.home.icons.IconShape.current = iconShape; com.oneuiclone.home.icons.IconFactory.comicBorder = comicBorder
         com.oneuiclone.home.icons.IconFactory.iconShine = iconShine
+        com.oneuiclone.home.icons.IconFactory.themeColor = themeColor
         com.oneuiclone.home.ui.FolderIconView.style = folderIcons
         com.oneuiclone.home.ui.FolderIconView.popupFolders = popupFolders
         com.oneuiclone.home.icons.IconShape.keepSquircle = keepSquircle }
@@ -36,9 +37,13 @@ class Prefs(context: Context) {
     var hideSearchRow: Boolean get() = sp.getBoolean("hide_search_row", false); set(v) = sp.edit().putBoolean("hide_search_row", v).apply()
     var lockLayout: Boolean get() = sp.getBoolean("lock_layout", false); set(v) = sp.edit().putBoolean("lock_layout", v).apply()
     var addNewApps: Boolean get() = sp.getBoolean("add_new_apps", false); set(v) = sp.edit().putBoolean("add_new_apps", v).apply()
+    /** Icons › Icon colour: Themed and Frosted icons' colour (opaque ARGB), or 0 for the colour palette's. Moves IconFactory.themeColor along with it. */
+    var themeColor: Int get() = sp.getInt("theme_color", 0)
+        set(v) { sp.edit().putInt("theme_color", v).apply(); com.oneuiclone.home.icons.IconFactory.themeColor = v }
     var themedIcons: Boolean get() = sp.getBoolean("themed_icons", false); set(v) = sp.edit().putBoolean("themed_icons", v).apply()
     /** Force a tonal theme icon on apps that don't ship a monochrome layer. */
-    var themeAllApps: Boolean get() = sp.getBoolean("theme_all_apps", true); set(v) = sp.edit().putBoolean("theme_all_apps", v).apply()
+    /** Theme all apps: always on since 0.219 (its toggle is gone). Apps without a monochrome layer get a recoloured icon too. */
+    val themeAllApps: Boolean get() = true
     /** Dark icons (Icon theme › Dark): every app's icon on a dark plate (IconFactory.createDark); excludes [themedIcons]. */
     var darkIcons: Boolean get() = sp.getBoolean("dark_icons", false); set(v) = sp.edit().putBoolean("dark_icons", v).apply()
     /** Minimal icons (Icon theme › Minimal): themed icons' white glyph alone, no plate (needs [themedIcons]). */

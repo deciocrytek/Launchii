@@ -64,6 +64,36 @@ private const val LAUNCH_WAIT_MS = 400L
 /** Longest the close zoom waits for Home to be put back on screen, on phones that never send a gesture contract. */
 private const val RETURN_WAIT_MS = 2000L
 private const val KEY_CONTRACT_SEEN = "contract_seen"
+/**
+ * Home-button close: longest Home's wallpaper copy covers for the hidden real one (the close normally finishes in
+ * ~225 ms; enter-complete came up to ~770 ms after the home intent on the Pixel), and its fade off the real one.
+ */
+private const val COVER_MAX_MS = 1500L
+private const val COVER_FADE_MS = 150L
+/** A launch within this long of the Home press keeps the copy until then (the slide is 225 ms, plus start latency). */
+private const val COVER_AFTER_LAUNCH_MS = 600L
+/**
+ * Home-button close, Home's drop (round 3 A2a, all of Home at once): from [DROP_UP] × screen width above, on a
+ * stiffness 400 / damping 0.66 spring (~1.5 dp bounce; 0.223 had 340 / 0.62, user: "speed up the ending a little"), after [DROP_DELAY_MS]; scale 0.97 → 1 and blur ([DROP_BLUR] × width, a sigma) → sharp
+ * over [DROP_FOCUS_MS]; alpha 0.55 → 1 over [DROP_FADE_MS]. The mockup was 286 px wide: 18 px up, 6 px blur.
+ */
+private const val DROP_UP = 18f / 286f
+private const val DROP_BLUR = 6f / 286f
+private const val DROP_SCALE = 0.03f
+private const val DROP_STIFFNESS = 400f
+private const val DROP_DAMPING = 0.66f
+private const val DROP_FOCUS_MS = 230f
+private const val DROP_FADE_MS = 140f
+private const val DROP_ALPHA = 0.55f
+private const val DROP_MS = 440L
+/**
+ * Home holds its start pose this long before dropping. On the Pixel (user recording 6856.mp4, two closes, same
+ * timing) the home intent reaches Home ~65 ms before the system starts sliding the app away, and the slide only
+ * uncovers the middle of the screen ~100 ms in: a drop started at the intent was ~95 % sharp and nearly landed
+ * before most of Home showed. Started here (~35 ms into the slide, as the top row shows) its focus and bounce
+ * play while Home is being uncovered and just after.
+ */
+private const val DROP_DELAY_MS = 100L
 /** Zoom In open: the card's spring (≈ 95 % open by 240 ms, ~1 % overshoot) and Home zooming toward the icon. */
 private const val ZOOM_IN_STIFFNESS = 300f
 private const val ZOOM_IN_DAMPING = 0.84f
@@ -371,6 +401,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
                 it.themedIcons = prefs.themedIcons; it.themeAllApps = prefs.themeAllApps; it.plateAlpha = prefs.iconPlateAlpha
                 it.darkIcons = prefs.darkIcons; it.minimalIcons = prefs.minimalIcons; it.iconLook = prefs.iconLook; it.iconMode = prefs.iconMode
                 it.iconShape = prefs.iconShape; it.comicBorder = prefs.comicBorder; it.iconShine = prefs.iconShine
+                it.themeColor = prefs.themeColor
             }
             repo = nr
             model = WorkspaceModel(activity, nr)
@@ -380,11 +411,13 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             val themeChanged = r.themedIcons != prefs.themedIcons || r.themeAllApps != prefs.themeAllApps ||
                 r.plateAlpha != prefs.iconPlateAlpha || r.darkIcons != prefs.darkIcons ||
                 r.minimalIcons != prefs.minimalIcons || r.iconLook != prefs.iconLook || r.iconMode != prefs.iconMode ||
-                r.iconShape != prefs.iconShape || r.comicBorder != prefs.comicBorder || r.iconShine != prefs.iconShine
+                r.iconShape != prefs.iconShape || r.comicBorder != prefs.comicBorder || r.iconShine != prefs.iconShine ||
+                r.themeColor != prefs.themeColor
             r.themedIcons = prefs.themedIcons
             r.iconShape = prefs.iconShape
             r.comicBorder = prefs.comicBorder
             r.iconShine = prefs.iconShine
+            r.themeColor = prefs.themeColor
             r.iconLook = prefs.iconLook
             r.iconMode = prefs.iconMode
             r.darkIcons = prefs.darkIcons
@@ -1472,6 +1505,126 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
     private var returnWaiting = false
     private val returnWaitCap = Runnable { homeShown("wait cap") }
 
+    /** Home was stopped and hasn't been resumed since: a home intent now brings it back from an app. */
+    private var stoppedSinceResume = false
+    private var coverAnim: ValueAnimator? = null
+    private val coverCap = Runnable { uncoverWallpaper("cap") }
+    private var coveredAt = 0L
+
+    /**
+     * A Home-button close (3-button navigation) into a launcher that isn't the recents provider plays Shell's default
+     * wallpaper-open transition: the app slides down (wallpaper_open_exit) over Home at full alpha. But Shell's
+     * setupStartState sets every opening change of an OPEN transition to alpha 0, the wallpaper included
+     * (ensureWallpaperInTransitions), and the default handler never animates the wallpaper, so it stays hidden until
+     * the finish transaction: Home sat on black for the whole 225 ms slide, then the wallpaper popped in (user
+     * recording 6853.mp4; reproduced on the Android 17 emulator with the system's own image wallpaper too). Home's
+     * window is the one thing on screen, so its copy stands in for the wallpaper until the close has finished.
+     * Without a copy (a wallpaper set outside Launchii) there's nothing to draw.
+     */
+    private fun coverWallpaper() {
+        if (!wallpaper.available) return
+        root.removeCallbacks(coverCap)
+        coverAnim?.cancel()
+        // the copy shows what the real one will: Launchii's live wallpaper waits at the zoom it was parked at
+        // (the close zoom then plays on both, from here or once Home is back)
+        if (com.oneuiclone.home.ui.LiveWallpaper.drives && zoomAnim?.isRunning != true) {
+            wallpaperZoom = com.oneuiclone.home.ui.LiveWallpaper.zoom
+            wallpaper.setZoom(wallpaperZoom)
+        }
+        wallpaper.copyAlpha = 1f
+        wallpaper.cover = true
+        coveredAt = android.os.SystemClock.uptimeMillis()
+        root.postDelayed(coverCap, COVER_MAX_MS)
+        AnimLog.log("wallpaper covered for a home-button close")
+    }
+
+    /** This return is a Home-button close (button navigation, no gesture contract): Home drops in ([playButtonDrop]). */
+    private var buttonClose = false
+    /** The drop while it runs: a launch stops it, whichever way it then zooms Home. */
+    private var dropAnim: ValueAnimator? = null
+
+    /** 3- or 2-button navigation (config_navBarInteractionMode 0 / 1; 2 is gestures). */
+    private fun buttonNavigation(): Boolean = try {
+        val res = activity.resources
+        val id = res.getIdentifier("config_navBarInteractionMode", "integer", "android")
+        (if (id != 0) res.getInteger(id) else android.provider.Settings.Secure.getInt(activity.contentResolver, "navigation_mode", 2)) != 2
+    } catch (_: Exception) { false }
+
+    /**
+     * Home's part of a Home-button close (user's pick 2026-11-13, "A2a, not layered, with a slight focus shift"; mockups
+     * "OneUI Home - Button close mockups round 3"): while the system slides the app down, all of Home drops into place
+     * from a little above on a soft spring (one small bounce), growing from 0.97 and going from blurred to sharp.
+     * Sizes follow the 286 px-wide mockup as fractions of the screen width.
+     */
+    private fun playButtonDrop() {
+        contentAnim?.cancel()
+        val v = homeLayer
+        val w = root.width.takeIf { it > 0 } ?: dp.widthPx
+        val up = w * DROP_UP
+        val sigma = w * DROP_BLUR
+        centrePivot(v)
+        v.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        fun frame(ms: Float) {
+            val y = springOffset(ms / 1000f, -up, DROP_STIFFNESS, DROP_DAMPING)
+            val q = Easing.CUBIC_OUT.getInterpolation((ms / DROP_FOCUS_MS).coerceIn(0f, 1f))
+            v.translationY = y
+            val s = 1f - DROP_SCALE * (1f - q)
+            v.scaleX = s; v.scaleY = s
+            v.alpha = DROP_ALPHA + (1f - DROP_ALPHA) * (ms / DROP_FADE_MS).coerceIn(0f, 1f)
+            // RenderEffect takes a radius; Skia's sigma = 0.57735 × radius + 0.5 (the mockup's CSS blur is a sigma)
+            val r = (sigma * (1f - q) - 0.5f) / 0.57735f
+            v.setRenderEffect(if (r > 0.5f) android.graphics.RenderEffect.createBlurEffect(r, r, android.graphics.Shader.TileMode.DECAL) else null)
+        }
+        fun rest() {
+            v.translationY = 0f; v.scaleX = 1f; v.scaleY = 1f; v.alpha = 1f
+            v.setRenderEffect(null)
+            v.setLayerType(View.LAYER_TYPE_NONE, null)
+        }
+        frame(0f)
+        AnimLog.log("button close: Home drops in")
+        contentAnim = ValueAnimator.ofFloat(0f, DROP_MS.toFloat()).also { dropAnim = it }.apply {
+            duration = DROP_MS
+            startDelay = DROP_DELAY_MS   // held at frame(0) under the app until the slide is under way
+            interpolator = android.view.animation.LinearInterpolator()
+            addUpdateListener { frame(it.animatedValue as Float) }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                // a launch cancels it and zooms Home from where it is; the drop's offset, fade and blur go
+                override fun onAnimationEnd(animation: android.animation.Animator) { if (dropAnim === animation) dropAnim = null; rest() }
+            })
+            start()
+        }
+    }
+
+    /** An underdamped spring's offset at [t] s, from [x0] at rest velocity toward 0. */
+    private fun springOffset(t: Float, x0: Float, stiffness: Float, damping: Float): Float {
+        val w = kotlin.math.sqrt(stiffness)
+        val wd = w * kotlin.math.sqrt(1f - damping * damping)
+        val b = damping * w * x0 / wd
+        return kotlin.math.exp(-damping * w * t) * (x0 * kotlin.math.cos(wd * t) + b * kotlin.math.sin(wd * t))
+    }
+
+    /** The real wallpaper is back: the copy fades off it (a launch takes it away at once). */
+    private fun uncoverWallpaper(source: String, fade: Boolean = true) {
+        if (!wallpaper.cover || (fade && coverAnim != null)) return   // gone, or already fading
+        root.removeCallbacks(coverCap)
+        coverAnim?.cancel()
+        AnimLog.log("wallpaper uncovered ($source)")
+        if (!fade) { wallpaper.cover = false; wallpaper.copyAlpha = 1f; return }
+        coverAnim = ValueAnimator.ofFloat(1f, 0f).apply {
+            duration = COVER_FADE_MS
+            addUpdateListener { wallpaper.copyAlpha = it.animatedValue as Float }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    if (coverAnim !== animation) return
+                    coverAnim = null
+                    wallpaper.cover = false
+                    wallpaper.copyAlpha = 1f
+                }
+            })
+            start()
+        }
+    }
+
     private fun homeShown(source: String) {
         homeCovered = false
         if (!returnWaiting) return
@@ -1503,6 +1656,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
      */
     fun closeFinished(source: String = "enter complete") {
         AnimLog.log("close finished ($source) heldLaunch=${pendingLaunch != null}")
+        if (source == "enter complete") uncoverWallpaper(source)
         closingUntil = 0L
         root.removeCallbacks(launchFallback)
         if (source != "wait cap") homeShown("enter complete")
@@ -1648,8 +1802,12 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         val dark = prefs.darkIcons && v.icon === app.icon && app.icon !== app.drawerIcon
         // a Dot, Prism or Stencil icon: the card starts as its plate
         val look = prefs.themedIcons && prefs.iconLook.isNotEmpty() && v.icon === app.icon && app.icon !== app.drawerIcon
+        // a plain Themed icon (not Frosted, Minimal or a look): the card starts as its theme-colour plate and fills in
+        val themed = prefs.themedIcons && !prefs.glassIcons && !prefs.minimalIcons && !prefs.darkIcons && prefs.iconLook.isEmpty() &&
+            v.icon === app.icon && app.icon !== app.drawerIcon
         val fromAlpha = when {
             minimal -> com.oneuiclone.home.ui.LaunchCard.MINIMAL_FROM_ALPHA
+            themed -> com.oneuiclone.home.ui.LaunchCard.THEMED_FROM_ALPHA
             // a Stencil icon's cut-out shows the wallpaper: an opaque card under it would fill the symbol in at the tap
             look && prefs.iconLook == com.oneuiclone.home.icons.IconFactory.LOOK_STENCIL -> com.oneuiclone.home.ui.LaunchCard.STENCIL_FROM_ALPHA
             look && prefs.iconLook in com.oneuiclone.home.icons.IconFactory.PLAYFUL -> com.oneuiclone.home.ui.LaunchCard.PLAYFUL_FROM_ALPHA
@@ -1659,6 +1817,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         zoomIn(icon, v.displayedIcon(), app, splashColor, v, fromAlpha,
             when {
                 dark -> com.oneuiclone.home.icons.IconFactory.DARK_PLATE
+                themed -> com.oneuiclone.home.icons.IconFactory.themeAccent(activity)
                 look -> com.oneuiclone.home.icons.IconFactory.lookCard(prefs.iconLook, com.oneuiclone.home.icons.IconFactory.lookNight(prefs.iconMode, iconFactory.isNight()))
                 else -> null
             })
@@ -1937,6 +2096,14 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
     private fun launched(app: AppInfo?, zoom: () -> Unit) {
         // Opened straight after a close: the landing icon's surface doesn't scale with Home, and the ripple is stale.
         finishContract()
+        // tapped mid-close: the real wallpaper is still hidden until the system's slide is over (a launch fast-forwards
+        // it), so the copy stays up a little and follows the open's zoom; after that it can go at once
+        if (wallpaper.cover) {
+            val keep = coveredAt + COVER_AFTER_LAUNCH_MS - android.os.SystemClock.uptimeMillis()
+            if (keep > 0) { root.removeCallbacks(coverCap); root.postDelayed(coverCap, keep) }
+            else uncoverWallpaper("launch", fade = false)
+        }
+        dropAnim?.let { dropAnim = null; it.cancel() }
         returnRipple?.let { root.removeCallbacks(it); returnRipple = null }
         // a close still waiting for Home to show is overtaken by this open
         returnWaiting = false
@@ -2006,6 +2173,9 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
     }
 
     fun onStop() {
+        stoppedSinceResume = true
+        buttonClose = false
+        dropAnim?.let { dropAnim = null; it.cancel() }   // settles Home before the close is armed below
         com.oneuiclone.home.widgets.SplitLaunch.homeStopped()   // a split's top app covers Home: the bottom one can go
         searchSources.refresh()                        // Home is off screen: suggestions can change unseen
         quickOpen?.close(animate = false)
@@ -2091,6 +2261,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
     }
 
     fun onResume() {
+        stoppedSinceResume = false
         AppUpdate.onResumed(activity)
         AppUpdate.checkIfDue()
         // back before the app covered Home (an app that closed at once, Back mid-open): the card shrinks back
@@ -2150,7 +2321,8 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
     private fun playReturnAnimation(landing: CloseTarget? = lastLaunchedApp?.let { closeTargetFor(it.key.component, it.user) }
         ?: lastWidgetLaunch?.let { widgetTarget(it) }, shown: Boolean = false) {
         if (!pendingReturnAnim) return
-        if (homeCovered && !contractSeen) {
+        // (not a Home-button close: Shell's default slide shows Home from its first frame, contract or not)
+        if (homeCovered && !contractSeen && !buttonClose) {
             // No gesture contract on this phone (Redmi A5, Android Go): its close shows only the wallpaper and puts
             // Home back after it, 0.3–0.6 s after the window is gone, so a zoom started now was over before Home
             // showed (it popped in at rest). Home waits, out of sight, at the open scale and grows once it's back.
@@ -2164,10 +2336,14 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         }
         pendingReturnAnim = false
         // once Home is back the system's close is over: a tap now needn't be held for it
-        if (!shown && hiddenSinceOpen) markClosing("return animation")
+        if (!shown && hiddenSinceOpen && !buttonClose) markClosing("return animation")
         AnimLog.log("return animation to ${(landing?.view as? com.oneuiclone.home.ui.WidgetContainer)?.let { "widget " + it.item.provider.packageName } ?: landing?.view?.contentDescription ?: "screen centre"}")
+        // A Home-button close drops Home in under the system's slide (no zoom, no ripple); everything else zooms back.
+        val drop = buttonClose && !folders.isOpen
+        buttonClose = false
         // The folder is still open only if Home was never stopped (a translucent app); it un-zooms in place.
-        animateContentScale(if (folders.isOpen) overlay else homeLayer, 1f, 450, Easing.APP_CLOSE_POSITION)
+        if (drop) playButtonDrop()
+        else animateContentScale(if (folders.isOpen) overlay else homeLayer, 1f, 450, Easing.APP_CLOSE_POSITION)
         // Recents may have left the real wallpaper at another offset: re-centre it now, while our copy covers it.
         centerWallpaper()
         if (com.oneuiclone.home.ui.LiveWallpaper.drives) {
@@ -2203,11 +2379,13 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             }
         }
         // REVERSE ripple from the icon the app returns to, or the screen centre (AppCloseAnimationDelegate.itemTouchEvent)
-        val r = Rect()
-        if (landing != null) landing.boundsOnScreen(r) else r.set(0, 0, root.width, root.height)
-        returnRipple?.let { root.removeCallbacks(it) }
-        returnRipple = Runnable { returnRipple = null; ripple.pulse(homeSiblings(), r.exactCenterX(), r.exactCenterY()) }
-            .also { root.postDelayed(it, 120) }
+        returnRipple?.let { root.removeCallbacks(it); returnRipple = null }
+        if (!drop) {
+            val r = Rect()
+            if (landing != null) landing.boundsOnScreen(r) else r.set(0, 0, root.width, root.height)
+            returnRipple = Runnable { returnRipple = null; ripple.pulse(homeSiblings(), r.exactCenterX(), r.exactCenterY()) }
+                .also { root.postDelayed(it, 120) }
+        }
         lastLaunchedApp = null
     }
 
@@ -2240,6 +2418,15 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             }
             playReturnAnimation(handleContract(contract))
         } else {
+            // no contract: the Home button (or another home intent) over an app, which the system slides away
+            if (!alreadyOnHome && stoppedSinceResume) {
+                coverWallpaper()
+                buttonClose = buttonNavigation()
+                // Shell's default close isn't merged into: an app started during it fast-forwards the slide, then opens
+                // with its own animation (DefaultTransitionHandler.mergeAnimation ends the running one). So a tap
+                // mid-close starts at once instead of being held for the close to finish.
+                if (buttonClose) { closingUntil = 0L; AnimLog.log("button close: taps start at once") }
+            }
             playReturnAnimation()
         }
         popup?.dismiss()
@@ -2286,11 +2473,17 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             out.set(loc[0], loc[1], loc[0] + (w.width * homeLayer.scaleX).toInt(), loc[1] + (w.height * homeLayer.scaleY).toInt())
         }
 
+        /** The landing rect in the window, with Home at rest (it may still be at the open scale). */
+        fun rectAtRest(): Rect = rect().also { r ->
+            val loc = IntArray(2); root.getLocationInWindow(loc)
+            r.offset(loc[0] + homeLayer.left, loc[1] + homeLayer.top)
+        }
+
         /** What an icon's landing surface shows, drawn to fill it. */
         fun snapshot(): ((android.graphics.Canvas) -> Unit)? {
             val bmp = when (view) {
                 is LargeFolderIconView -> view.slotBitmap(slot)
-                is FolderIconView -> view.renderIcon()
+                is FolderIconView -> view.renderIcon(rectAtRest())
                 else -> (view as IconView).displayedIcon()
             } ?: return null
             val paint = android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG)
@@ -2633,6 +2826,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             configureIcon = { v, a -> setAppsIcon(v, a); v.appInfo = a; attachItem(v, null, a, true) { folderSiblings(v) } },
             sources = searchSources,
             firstPage = { model?.firstPageApps() ?: emptySet() },
+            glass = widgetGlass,
             onOpenIntent = { v, intent ->
                 closeSearch(toHome = false)
                 launchFrom(v) { _, opts -> activity.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), opts) }
@@ -2729,6 +2923,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
     /** A finger caught the lift mid-spring at [y]: it carries on from where it is. */
     private fun catchLift(y: Float) {
         liftSpring?.cancel(); liftSpring = null
+        search?.bounceBar(0f)
         liftTracking = true
         val d = lift * liftDistance()
         liftDownY = if (liftFromAbove) y - d else y + d
@@ -2752,12 +2947,13 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
 
     /**
      * Carries the lift to [target] from the finger's [velocity] (progress/s), without overshoot; only the bar
-     * bounces as it lands, by [bounce] (0–1) of [LIFT_BOUNCE_DP].
+     * bounces as it lands, by [bounce] (0–1) of [LIFT_BOUNCE_DP]: it takes itself over on the way in, so the
+     * overshoot comes with the arrival rather than after it.
      */
     private fun springLift(target: Float, velocity: Float = 0f, bounce: Float = 0f) {
         liftSpring?.cancel()
         liftTarget = target
-        var kick = bounce
+        search?.bounceBar(if (target >= 1f) dp.dp(LIFT_BOUNCE_DP) * bounce else 0f)
         lateinit var a: SpringAnimation
         a = SpringAnimation(FloatValueHolder(lift)).apply {
             spring = SpringForce(target).setStiffness(LIFT_STIFFNESS).setDampingRatio(SpringForce.DAMPING_RATIO_NO_BOUNCY)
@@ -2766,14 +2962,12 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             addUpdateListener { _, value, _ ->
                 if (liftSpring !== a) return@addUpdateListener
                 applyLift(value)
-                if (kick > 0f && value >= 0.985f) { search?.bounceBar(dp.dp(LIFT_BOUNCE_DP) * kick); kick = 0f }
             }
             addEndListener { _, canceled, _, _ ->
                 if (canceled || liftSpring !== a) return@addEndListener
                 liftSpring = null
                 applyLift(target)
                 liftDone(target >= 1f)
-                if (kick > 0f) search?.bounceBar(dp.dp(LIFT_BOUNCE_DP) * kick)
             }
         }
         liftSpring = a

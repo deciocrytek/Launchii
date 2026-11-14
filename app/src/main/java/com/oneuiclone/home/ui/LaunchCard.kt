@@ -182,5 +182,10 @@ class LaunchCard(context: Context) : View(context) {
          * wobbles), so one solid plate colour under the icon at the tap shows as a square behind it; the card fills in.
          */
         const val PLAYFUL_FROM_ALPHA = 0f
+        /**
+         * [fromAlpha] for a Themed icon (0.220): like the playful ones, the card starts see-through in the icon's theme
+         * colour ([fromColor]) and fills in, turning into the app's colour, instead of a solid app-colour square at the tap.
+         */
+        const val THEMED_FROM_ALPHA = 0f
     }
 }

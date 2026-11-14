@@ -60,7 +60,7 @@ class StylePreview(private val activity: Activity) {
     /** The icon settings being previewed (sliders preview before they're saved). */
     data class Look(val iconScale: Int, val themed: Boolean, val themeAll: Boolean, val plateAlpha: Float, val labels: Boolean, val dark: Boolean,
                     val minimal: Boolean, val look: String, val mode: String, val shape: String,
-                    val comicBorder: Boolean, val shine: Boolean) {
+                    val comicBorder: Boolean, val shine: Boolean, val themeColor: Int = 0) {
         companion object {
             /** The saved settings, with any slider being dragged in their place. */
             fun of(prefs: Prefs, iconScale: Int = prefs.iconScale, transparency: Int = prefs.glassIconTransparency) = Look(
@@ -76,6 +76,7 @@ class StylePreview(private val activity: Activity) {
                 shape = prefs.iconShape,
                 comicBorder = prefs.comicBorder,
                 shine = prefs.iconShine,
+                themeColor = prefs.themeColor,
             )
         }
     }
@@ -111,6 +112,8 @@ class StylePreview(private val activity: Activity) {
     )
 
     @Volatile private var loaded: Loaded? = null
+    /** Goes up each time [load] reads Home and the wallpapers again, so strips made before are known to be stale. */
+    var version = 0; private set
     private var widgetShots: Map<Int, Bitmap> = emptyMap()
     private var generation = 0
     /** Icons last made, and for which size and look, so a label-only change reuses them. */
@@ -127,6 +130,7 @@ class StylePreview(private val activity: Activity) {
             main.post {
                 if (io.isShutdown || l == null) return@post
                 loaded = l
+                version++
                 iconsFor = null
                 widgetShots = Launcher.live?.get()?.let { home ->
                     l.items.filterIsInstance<HomeItem.Widget>().mapNotNull { w -> home.widgetSnapshot(w.appWidgetId)?.let { w.appWidgetId to it } }.toMap()
@@ -219,19 +223,101 @@ class StylePreview(private val activity: Activity) {
         val l = loaded ?: return
         val gen = ++generation
         val dp = profile(look.iconScale)
-        val key = listOf(dp.iconSizePx, look.themed, look.themeAll, look.plateAlpha, look.dark, look.minimal, look.look, look.mode, look.shape, look.comicBorder, look.shine, iconFactory.isNight())
+        val key = listOf(dp.iconSizePx, look.themed, look.themeAll, look.plateAlpha, look.dark, look.minimal, look.look, look.mode, look.shape, look.comicBorder, look.shine, look.themeColor, iconFactory.isNight())
         val use = { made: Map<AppKey, Bitmap> -> if (gen == generation) then(l, dp, made) }
         if (key == iconsFor) { use(icons); return }
         io.execute {
-            val night = iconFactory.isNight()
-            val made = l.drawables.mapValues { (k, v) ->
-                iconFactory.homeIcon(v.second, dp.iconSizePx, night, look.themed, look.themeAll, look.plateAlpha, look.dark, k.component.packageName, look.minimal, look.look, look.mode).first
-            }
+            val made = makeIcons(l, dp, look)
             main.post {
                 if (io.isShutdown) return@post
                 icons = made; iconsFor = key
                 use(made)
             }
+        }
+    }
+
+    /** Home's icons in [look], at [dp]'s size, in [look]'s Icon colour. Off the main thread (on [io]). */
+    private fun makeIcons(l: Loaded, dp: DeviceProfile, look: Look): Map<AppKey, Bitmap> {
+        val night = iconFactory.isNight()
+        iconFactory.ownColour = look.themeColor
+        return l.drawables.mapValues { (k, v) ->
+            iconFactory.homeIcon(v.second, dp.iconSizePx, night, look.themed, look.themeAll, look.plateAlpha, look.dark, k.component.packageName, look.minimal, look.look, look.mode).first
+        }
+    }
+
+    private var stripsGen = 0
+
+    /**
+     * The dock strip ([render]'s second bitmap) at [dockWidth] for each of [looks], handed to [done] together (main
+     * thread) once all are drawn; a newer call supersedes it. Runs apart from [render], so neither cancels the other.
+     */
+    fun dockStrips(looks: List<Look>, dockWidth: Int, done: (List<Bitmap>) -> Unit) {
+        val l = loaded ?: return
+        val gen = ++stripsGen
+        io.execute {
+            val sets = looks.map { look -> profile(look.iconScale).let { dp -> dp to makeIcons(l, dp, look) } }
+            main.post {
+                if (io.isShutdown || gen != stripsGen || loaded !== l) return@post
+                done(looks.indices.map { i ->
+                    val (dp, made) = sets[i]
+                    drawDock(l, dp, buildHome(l, dp, looks[i], made, bright(l)), dockWidth)
+                })
+            }
+        }
+    }
+
+    /**
+     * Any Icon colour in the dock strip at once, mixed from the strip drawn with black plates ([black]) and with
+     * white ones ([white]), with nothing else different. Each pixel of the strip is a fixed blend of the plate colour
+     * and things that don't change with it (glyph, wallpaper, glass, contour, edges, scaling): for each channel,
+     * pixel = black + (white − black) × plate / 255. That holds for Themed and Frosted with a picked colour (Theme all
+     * apps' deep tone is the plate at half brightness, also a blend); the colour palette's own colour isn't mixed
+     * this way (its deep tone is a separate palette colour), so it gets its own strip. Off by at most a level of 255
+     * from drawing it outright, from rounding.
+     */
+    class Recolour(black: Bitmap, white: Bitmap) {
+        private val w = black.width
+        private val h = black.height
+        private val n = w * h
+        private val base = IntArray(n).also { black.getPixels(it, 0, w, 0, 0, w, h) }
+        private val dr = ShortArray(n)
+        private val dg = ShortArray(n)
+        private val db = ShortArray(n)
+        /** Pixels that change with the colour (the plates); the rest (wallpaper) is copied as it is. */
+        private val moves: IntArray
+        private val px = base.copyOf()
+        private val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+
+        init {
+            val wp = IntArray(n).also { white.getPixels(it, 0, w, 0, 0, w, h) }
+            val list = IntArray(n)
+            var m = 0
+            for (i in 0 until n) {
+                val b = base[i]; val c = wp[i]
+                val r = ((c shr 16) and 0xFF) - ((b shr 16) and 0xFF)
+                val g = ((c shr 8) and 0xFF) - ((b shr 8) and 0xFF)
+                val bl = (c and 0xFF) - (b and 0xFF)
+                if (r != 0 || g != 0 || bl != 0) {
+                    dr[i] = r.toShort(); dg[i] = g.toShort(); db[i] = bl.toShort(); list[m++] = i
+                }
+            }
+            moves = list.copyOf(m)
+        }
+
+        /** The strip in [colour] (opaque ARGB). Reuses one bitmap: what it returned before changes with it. */
+        fun mix(colour: Int): Bitmap {
+            val kr = ((colour shr 16) and 0xFF) / 255f
+            val kg = ((colour shr 8) and 0xFF) / 255f
+            val kb = (colour and 0xFF) / 255f
+            for (i in moves) {
+                val b = base[i]
+                val r = (((b shr 16) and 0xFF) + dr[i] * kr + 0.5f).toInt().coerceIn(0, 255)
+                val g = (((b shr 8) and 0xFF) + dg[i] * kg + 0.5f).toInt().coerceIn(0, 255)
+                val bl = ((b and 0xFF) + db[i] * kb + 0.5f).toInt().coerceIn(0, 255)
+                px[i] = (b and 0xFF000000.toInt()) or (r shl 16) or (g shl 8) or bl
+            }
+            out.setPixels(px, 0, w, 0, 0, w, h)
+            return out
         }
     }
 
@@ -305,10 +391,11 @@ class StylePreview(private val activity: Activity) {
         return root
     }
 
+    /** Whether Home's wallpaper is light enough for dark labels and dots. */
+    private fun bright(l: Loaded) = l.homeColors != null && (l.homeColors.colorHints and WallpaperColors.HINT_SUPPORTS_DARK_TEXT) != 0
+
     private fun drawHome(l: Loaded, dp: DeviceProfile, look: Look, made: Map<AppKey, Bitmap>, homeWidth: Int, dockWidth: Int): Pair<Bitmap, Bitmap> {
-        val bright = l.homeColors != null && (l.homeColors.colorHints and WallpaperColors.HINT_SUPPORTS_DARK_TEXT) != 0
-        val root = buildHome(l, dp, look, made, bright)
-        val dock = l.items.filter { it.container == Container.HOTSEAT }
+        val root = buildHome(l, dp, look, made, bright(l))
         val wall = l.home ?: gradient(l.homeColors)
         val screenW = width.toFloat()
         val home = Bitmap.createBitmap(homeWidth, (homeWidth * height / width.toFloat()).toInt(), Bitmap.Config.ARGB_8888)
@@ -317,6 +404,14 @@ class StylePreview(private val activity: Activity) {
             WallpaperLayer.drawFramed(this, wall)
             root.draw(this)
         }
+        return home to drawDock(l, dp, root, dockWidth)
+    }
+
+    /** [root] (from [buildHome]) cut to the dock's band, [dockWidth] wide. */
+    private fun drawDock(l: Loaded, dp: DeviceProfile, root: View, dockWidth: Int): Bitmap {
+        val dock = l.items.filter { it.container == Container.HOTSEAT }
+        val wall = l.home ?: gradient(l.homeColors)
+        val screenW = width.toFloat()
         // the dock's band, or the first row's (centred on it, as tall) when there's no dock
         val bandH = dp.hotseatRect.height()
         val bandTop = if (dock.isNotEmpty()) dp.hotseatRect.top else dp.workspaceGrid.top + dp.cellHeight / 2 - bandH / 2
@@ -327,7 +422,7 @@ class StylePreview(private val activity: Activity) {
             WallpaperLayer.drawFramed(this, wall)
             root.draw(this)
         }
-        return home to dockOut
+        return dockOut
     }
 
     /**
@@ -372,6 +467,7 @@ class StylePreview(private val activity: Activity) {
             val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
             for ((i, look) in looks.withIndex()) {
                 if (io.isShutdown) return@execute
+                iconFactory.ownColour = look.themeColor
                 val out = patch.copy(Bitmap.Config.ARGB_8888, true)
                 val c = Canvas(out)
                 for ((j, k) in apps.withIndex()) {

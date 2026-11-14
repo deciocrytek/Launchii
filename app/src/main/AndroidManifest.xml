@@ -117,6 +117,14 @@
             android:theme="@android:style/Theme.DeviceDefault.DayNight" />
 
         <!-- Icons › Icon theme: every theme as a card -->
+        <!-- Icons › Icon colour -->
+        <activity
+            android:name=".settings.IconColourActivity"
+            android:autoRemoveFromRecents="true"
+            android:exported="false"
+            android:label="Icon colour"
+            android:taskAffinity="app.launchii.settings"
+            android:theme="@android:style/Theme.DeviceDefault.DayNight" />
         <activity
             android:name=".settings.IconThemePickerActivity"
             android:autoRemoveFromRecents="true"

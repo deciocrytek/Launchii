@@ -164,7 +164,8 @@ open class FolderIconView(context: Context, dp: DeviceProfile) : IconView(contex
         rimPaint.alpha = (0x24 * containerAlpha).toInt()
         canvas.drawPath(shape, rimPaint)
         drawnAt.reset(); transformMatrixToGlobal(drawnAt)
-        glassAt.set(drawnAt); glassAt.preTranslate(left.toFloat(), top.toFloat())
+        val at = glassFixed
+        if (at != null) glassAt.set(at) else { glassAt.set(drawnAt); glassAt.preTranslate(left.toFloat(), top.toFloat()) }
         if (glassPaint.aim(glass, glassAt)) {
             glassPaint.paint.alpha = (255 * containerAlpha).toInt()
             canvas.drawPath(shape, glassPaint.paint)
@@ -256,10 +257,21 @@ open class FolderIconView(context: Context, dp: DeviceProfile) : IconView(contex
 
     fun iconRectOnScreen(out: Rect) = iconBoundsOnScreen(out)
 
-    /** The folder icon as drawn, for the surface an app closes into. */
-    fun renderIcon(): Bitmap {
+    /** While set (by [renderIcon]): icon → window for the glass, in place of where the icon is drawn now. */
+    private var glassFixed: Matrix? = null
+
+    /**
+     * The folder icon as drawn, for the surface an app closes into. [atRest] is the icon's rect in the window once
+     * Home is back at rest: the glass is the blurred wallpaper there, not where the icon is now. When the contract
+     * comes, Home still waits at the open scale (0.85 about the centre), so the surface's glass came from a lighter
+     * part of the wallpaper and snapped to the real one when the icon took over on landing (recording 6937).
+     */
+    fun renderIcon(atRest: Rect? = null): Bitmap {
         val b = Bitmap.createBitmap(iconSize, iconSize, Bitmap.Config.ARGB_8888)
-        drawIcon(Canvas(b), 0, 0)
+        glassFixed = atRest?.let { r ->
+            Matrix().apply { setScale(r.width() / iconSize.toFloat(), r.height() / iconSize.toFloat()); postTranslate(r.left.toFloat(), r.top.toFloat()) }
+        }
+        try { drawIcon(Canvas(b), 0, 0) } finally { glassFixed = null }
         return b
     }
 }

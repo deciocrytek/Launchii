@@ -91,7 +91,8 @@ object QuickOpenWidget {
      * [plateAlpha] when they're see-through, otherwise at [FROST_ALPHA] so the glass still shows.
      */
     fun frost(context: Context, night: Boolean, plateAlpha: Float): Int {
-        val accent = context.getColor(if (night) android.R.color.system_accent1_500 else android.R.color.system_accent1_400)
+        com.oneuiclone.home.settings.Prefs(context)   // sets the picked icon colour for this process
+        val accent = com.oneuiclone.home.icons.IconFactory.themeAccent(context)
         val a = if (plateAlpha < 1f) plateAlpha.coerceIn(0.2f, 0.7f) else FROST_ALPHA
         return (accent and 0x00FFFFFF) or ((a * 255).roundToInt() shl 24)
     }
@@ -358,7 +359,7 @@ class QuickOpenActivity : Activity() {
                 val prefs = Prefs(context)
                 val night = (context.resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) == android.content.res.Configuration.UI_MODE_NIGHT_YES
                 return listOf(night, prefs.themedIcons, prefs.themeAllApps, prefs.iconPlateAlpha, prefs.darkIcons,
-                    prefs.themeAppsScreen, prefs.minimalIcons, prefs.iconLook, prefs.iconMode, prefs.iconShape, prefs.comicBorder, prefs.iconShine, context.resources.displayMetrics.density)
+                    prefs.themeAppsScreen, prefs.minimalIcons, prefs.iconLook, prefs.iconMode, prefs.iconShape, prefs.comicBorder, prefs.iconShine, prefs.themeColor, context.resources.displayMetrics.density)
             }
 
             /** Lists the apps and scores them (reusing [old]'s icons), draws the most used, and keeps the result. */

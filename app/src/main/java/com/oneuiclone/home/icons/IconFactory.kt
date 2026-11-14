@@ -94,6 +94,15 @@ class IconFactory(private val context: Context) {
         @Volatile var comicBorder = true
         /** The icons' contour (One UI's emboss: a light rim along the top, a faint dark one all round; Satin's light rim; Icons › Icon contour, Prefs.iconShine). */
         @Volatile var iconShine = true
+        /** Icons › Icon colour: the colour Themed and Frosted icons take (opaque ARGB), or 0 for the colour palette's (Prefs.themeColor). */
+        @Volatile var themeColor = 0
+
+        /**
+         * Themed and Frosted icons' plate: the picked [themeColor], or the colour palette's accent (system_accent1_400).
+         * The same shade in light and dark mode (0.217: the darker dark-mode shade, accent1_500, is gone).
+         */
+        fun themeAccent(context: Context): Int =
+            if (themeColor != 0) themeColor or 0xFF000000.toInt() else context.getColor(android.R.color.system_accent1_400)
         /** Icon theme › Groovy: the glyph cut out of cream, ringed by three 70s stripes in the app's colour family. */
         const val LOOK_GROOVY = "groovy"
         /** The playful looks (the Zoom In card fills in around them: LaunchCard.PLAYFUL_FROM_ALPHA). */
@@ -238,6 +247,16 @@ class IconFactory(private val context: Context) {
     private fun decode(id: Int): Bitmap = BitmapFactory.decodeResource(
         context.resources, id, BitmapFactory.Options().apply { inScaled = false })
 
+    /**
+     * This factory's own Icon colour (opaque ARGB, 0 = the colour palette's), or null to follow the saved one
+     * ([themeColor]). The Icons page preview draws in colours that aren't saved (and in black and white, to mix
+     * any other from) without touching the icons Home draws.
+     */
+    @Volatile var ownColour: Int? = null
+    private fun picked() = ownColour ?: themeColor
+    /** [themeAccent] for [picked]. */
+    private fun accent(): Int = picked().let { if (it != 0) it or 0xFF000000.toInt() else context.getColor(android.R.color.system_accent1_400) }
+
     fun isNight(ctx: Context = context): Boolean =
         (ctx.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
 
@@ -286,7 +305,7 @@ class IconFactory(private val context: Context) {
     }
 
     /**
-     * SemAppIconSolution.getColorThemeIcon(): accent background (system_accent1_400 / _500 at night) with the
+     * SemAppIconSolution.getColorThemeIcon(): accent background ([themeAccent], the same in light and dark mode) with the
      * monochrome layer tinted white (One UI goes black at night; the user wants white in both), then emboss + mask.
      * Falls back to the normal icon.
      * [plateAlpha] below 1 (glass icons): the background is that see-through, for the glass drawn under it.
@@ -294,7 +313,7 @@ class IconFactory(private val context: Context) {
     fun createThemed(src: Drawable, size: Int, night: Boolean = isNight(), plateAlpha: Float = 1f): Bitmap {
         val mono = (src as? AdaptiveIconDrawable)?.monochrome ?: return create(src, size, night)
         val res = context.resources
-        val accent = res.getColor(if (night) android.R.color.system_accent1_500 else android.R.color.system_accent1_400, null)
+        val accent = accent()
         val bg = (accent and 0x00FFFFFF) or ((plateAlpha.coerceIn(0f, 1f) * 255).roundToInt() shl 24)
         val fg = Color.WHITE
         val glyph = mono.constantState?.newDrawable(res)?.mutate() ?: mono.mutate()
@@ -774,10 +793,12 @@ class IconFactory(private val context: Context) {
     fun createTonal(src: Drawable, size: Int, night: Boolean = isNight(), plateAlpha: Float = 1f, glyphOnly: Boolean = false,
                     bare: Boolean = false): Bitmap {
         val res = context.resources
-        val plate = res.getColor(if (night) android.R.color.system_accent1_500 else android.R.color.system_accent1_400, null)
+        val plate = accent()
         // white glyph in light and dark mode alike (as createThemed), so detail on the other side of the plate goes deep
         val glyph = Color.WHITE
-        val away = res.getColor(android.R.color.system_accent1_700, null)
+        // the deep side: the palette's darker tone, or the picked colour darkened to about as far
+        val away = if (picked() != 0) androidx.core.graphics.ColorUtils.blendARGB(plate, Color.BLACK, 0.5f)
+            else res.getColor(android.R.color.system_accent1_700, null)
 
         val layers = blank(size)
         val c = Canvas(layers)

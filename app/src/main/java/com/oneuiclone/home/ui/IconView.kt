@@ -66,6 +66,7 @@ open class IconView(context: Context, protected val dp: DeviceProfile) : View(co
             field = v
             textPaint.color = if (v) 0xFF1D1D1F.toInt() else 0xFFFAFAFA.toInt()
             if (v) textPaint.clearShadowLayer() else textPaint.setShadowLayer(dp.dp(2f), 0f, 0f, 0x59000000)
+            shadowAlpha = 0x59
             invalidate()
         }
 
@@ -84,6 +85,8 @@ open class IconView(context: Context, protected val dp: DeviceProfile) : View(co
         // text_shadow_radius 2 / dy 0 (One UI Home integers.xml)
         setShadowLayer(dp.dp(2f), 0f, 0f, 0x59000000)
     }
+    /** Alpha of [textPaint]'s current shadow (follows [labelAlpha]). */
+    private var shadowAlpha = 0x59
     private var drawnLabel: CharSequence = ""
     private val dst = Rect()
 
@@ -157,6 +160,12 @@ open class IconView(context: Context, protected val dp: DeviceProfile) : View(co
             val fm = textPaint.fontMetrics
             val baseline = top + iconSize + dp.iconLabelGapPx - fm.ascent
             textPaint.alpha = (255 * labelAlpha).toInt()
+            // A translucent shadow colour ignores the paint's alpha, so a fading label showed as its
+            // full dark shadow under faint text (dark labels at the start of a folder open): fade it too.
+            if (!darkText) {
+                val sa = (0x59 * labelAlpha).toInt()
+                if (sa != shadowAlpha) { shadowAlpha = sa; textPaint.setShadowLayer(dp.dp(2f), 0f, 0f, sa shl 24) }
+            }
             canvas.drawText(drawnLabel, 0, drawnLabel.length, width / 2f, baseline, textPaint)
         }
     }

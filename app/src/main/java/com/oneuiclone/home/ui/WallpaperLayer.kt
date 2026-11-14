@@ -317,6 +317,13 @@ class WallpaperLayer(context: Context) : android.view.ViewGroup(context) {
     var holdCopy = false
         set(v) { field = v; updateViews() }
 
+    /**
+     * The copy stands in for the real wallpaper, which the system is keeping hidden (a Home-button close): shown at
+     * the current zoom whatever else is going on, live wallpaper included.
+     */
+    var cover = false
+        set(v) { field = v; updateViews() }
+
     /** Home's layer: its zoom also drives Launchii's live wallpaper, when that's the wallpaper. */
     var drivesLive = false
 
@@ -337,7 +344,7 @@ class WallpaperLayer(context: Context) : android.view.ViewGroup(context) {
         val zoomed = zoom != 1f
         // Launchii's live wallpaper zooms itself: the copy would only cross-dissolve with it
         val live = drivesLive && LiveWallpaper.drives
-        sharpView.visibility = if ((zoomed || holdCopy) && blurProgress < 1f && !live) VISIBLE else INVISIBLE
+        sharpView.visibility = if (((zoomed || holdCopy) && !live || cover) && blurProgress < 1f) VISIBLE else INVISIBLE
         val z = zoom * systemScale
         sharpView.scaleX = z; sharpView.scaleY = z
         if (blurProgress > 0f) {

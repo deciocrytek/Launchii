@@ -95,13 +95,20 @@ class SearchPill(context: Context, private val dp: DeviceProfile, private val hi
     }
 }
 
-/** Search bar palette: light glass with grey ink by day, dark glass with light ink in dark mode. */
+/**
+ * Search bar palette: light glass with grey ink by day, dark glass with light ink in dark mode. The open bar is
+ * frosted: [frost] over the blurred wallpaper ([frostBare] when there's no wallpaper copy to blur, so it's a little
+ * milkier over the window blur instead), edged by [frostStroke].
+ */
 class SearchColors private constructor(
-    val pill: Int, val homePill: Int, val open: Int, val stroke: Int, val hint: Int, val text: Int,
+    val pill: Int, val homePill: Int, val frost: Int, val frostBare: Int, val frostStroke: Int,
+    val stroke: Int, val hint: Int, val text: Int,
 ) {
     companion object {
-        private val DAY = SearchColors(0xD9FFFFFF.toInt(), 0x99FFFFFF.toInt(), 0xF2FFFFFF.toInt(), 0x33FFFFFF, 0xFF5C5C61.toInt(), 0xFF1C1C1E.toInt())
-        private val NIGHT = SearchColors(0xD92A2A2E.toInt(), 0x992A2A2E.toInt(), 0xF22A2A2E.toInt(), 0x1FFFFFFF, 0xFFA9A9AE.toInt(), 0xFFFAFAFA.toInt())
+        private val DAY = SearchColors(0xD9FFFFFF.toInt(), 0x99FFFFFF.toInt(), 0x3DFFFFFF, 0x52FFFFFF, 0x59FFFFFF,
+            0x33FFFFFF, 0xFF5C5C61.toInt(), 0xFF1C1C1E.toInt())
+        private val NIGHT = SearchColors(0xD92A2A2E.toInt(), 0x992A2A2E.toInt(), 0x6B1C1C1E, 0x8C1C1C1E.toInt(), 0x29FFFFFF,
+            0x1FFFFFFF, 0xFFA9A9AE.toInt(), 0xFFFAFAFA.toInt())
 
         fun of(context: Context) = if ((context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
             Configuration.UI_MODE_NIGHT_YES) NIGHT else DAY

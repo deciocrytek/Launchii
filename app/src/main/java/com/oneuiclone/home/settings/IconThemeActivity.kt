@@ -28,7 +28,7 @@ class IconThemeActivity : OneUiPage() {
             "Doodle", "Sprinkles", "Comic", "Groovy", "Glass")
         val SUMMARIES = listOf(
             "Each app's own icon",
-            "Your colour palette on app icons",
+            "Your colour palette, or a colour you pick, on app icons",
             "Theme icons on see-through glass over your wallpaper",
             "Dark backgrounds with each app's colours, for any app",
             "Just the white symbols, with no icon shape behind them",
@@ -48,8 +48,8 @@ class IconThemeActivity : OneUiPage() {
         /** The styles with a light and a dark version (Dot, Prism, the playful ones and Glass), which get Light or dark. */
         private val LIGHT_AND_DARK = setOf(5, 6, 9, 10, 11, 12, 13)
         private const val COMIC = 11
-        /** Glass works from every app's own icon, so Theme all apps doesn't apply to it. */
-        private const val GLASS = 13
+        /** The styles drawn in the theme colour (Themed and Frosted), which get Icon colour. */
+        private val COLOURED = setOf(1, 2)
         /** The styles whose plate has a contour (One UI's emboss, Satin's or Glass's rim), which get Icon contour. */
         private val CONTOURED = setOf(0, 1, 2, 3, 5, 6, 7, 8, 10, 12, 13)
         /** Each look's style index. */
@@ -103,7 +103,6 @@ class IconThemeActivity : OneUiPage() {
     /** Slider positions while dragged, previewed before they're saved. */
     private var liveTransparency: Int? = null
     private var liveScale: Int? = null
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         preview = StylePreview(this)
@@ -117,7 +116,7 @@ class IconThemeActivity : OneUiPage() {
     override fun build() {
         // the icon shape changed while this page was away: show the new one in the shape row too
         if (built && prefs.iconShape != shapeShown) { recreate(); return }
-        if (!built) { built = true; shapeShown = prefs.iconShape; layout() } else onReturn?.invoke(style(prefs))
+        if (!built) { built = true; shapeShown = prefs.iconShape; layout() } else { onReturn?.invoke(style(prefs)); colourShown?.invoke() }
         preview.load { refreshDock() }
     }
 
@@ -131,6 +130,32 @@ class IconThemeActivity : OneUiPage() {
 
     private fun refreshDock() = preview.render(StylePreview.Look.of(prefs, iconScale = liveScale ?: prefs.iconScale,
         transparency = liveTransparency ?: prefs.glassIconTransparency), stripWidth() / 3, stripWidth()) { _, dock -> dockStrip.bitmap = dock }
+
+    /**
+     * Icon colour (Themed and Frosted): a row with the colour in a swatch; tapping it opens the Icon colour page
+     * ([IconColourActivity]). Returns a function that shows or hides the row; [onReturn] shows a colour picked there.
+     */
+    private fun colourRow(): (Boolean) -> Unit {
+        val paletteColour = getColor(android.R.color.system_accent1_400)
+        val shown = { if (prefs.themeColor != 0) prefs.themeColor else paletteColour }
+        val swatch = SwatchDot(this).apply { color = shown() }
+        val chevron = android.widget.ImageView(this).apply { setImageDrawable(Chevron(sub, dp(10f), d, right = true)) }
+        val trailing = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            addView(swatch, LinearLayout.LayoutParams(dp(26f), dp(26f)))
+            addView(chevron, LinearLayout.LayoutParams(dp(10f), dp(10f)).apply { marginStart = dp(14f) })
+        }
+        val r = row("Icon colour", IconColourActivity.name(prefs.themeColor), sub, trailing, {
+            startActivity(android.content.Intent(this, IconColourActivity::class.java))
+        })
+        val summary = (r.getChildAt(0) as LinearLayout).getChildAt(1) as android.widget.TextView
+        colourShown = { swatch.color = shown(); summary.text = IconColourActivity.name(prefs.themeColor) }
+        return { on -> r.visibility = if (on) View.VISIBLE else View.GONE }
+    }
+
+    /** Shows the saved colour in the Icon colour row (after the Icon colour page). */
+    private var colourShown: (() -> Unit)? = null
 
     /**
      * Icon shape: a row with the current shape in a chip; tapping it opens every shape as a tile under it (tap one to
@@ -272,14 +297,14 @@ class IconThemeActivity : OneUiPage() {
         shapeCard()
         card {
             val style = style(prefs)
-            lateinit var themedRows: List<View>
             lateinit var modeRows: List<View>
             lateinit var anyRows: List<View>
             lateinit var frostedRows: List<View>
             lateinit var comicRows: List<View>
             lateinit var contourRows: List<View>
+            lateinit var colourRows: (Boolean) -> Unit
             fun showFor(s: Int) {
-                themedRows.forEach { it.visibility = if (s in THEMED && s != GLASS) View.VISIBLE else View.GONE }
+                colourRows(s in COLOURED)
                 modeRows.forEach { it.visibility = if (s in LIGHT_AND_DARK) View.VISIBLE else View.GONE }
                 anyRows.forEach { it.visibility = if (s > 0) View.VISIBLE else View.GONE }
                 frostedRows.forEach { it.visibility = if (s == 2) View.VISIBLE else View.GONE }
@@ -293,6 +318,7 @@ class IconThemeActivity : OneUiPage() {
             })
             val summary = (r.getChildAt(0) as LinearLayout).getChildAt(1) as android.widget.TextView
             onReturn = { s -> summary.text = STYLES[s]; showFor(s) }
+            colourRows = colourRow()
             modeRows = added {
                 val mode = MODES.indexOfFirst { it.first == prefs.iconMode }.coerceAtLeast(0)
                 dropdown("Light or dark", MODES.map { it.second }, mode, MODE_SUMMARIES) { m ->
@@ -307,11 +333,6 @@ class IconThemeActivity : OneUiPage() {
             contourRows = added {
                 toggle("Icon contour", "The soft light and shading along the edge of each icon. Off for a plain, flat look.", prefs.iconShine) {
                     prefs.iconShine = it; refreshDock()
-                }
-            }
-            themedRows = added {
-                toggle("Theme all apps", "Recolour apps that don't support theme icons so every icon matches.", prefs.themeAllApps) {
-                    prefs.themeAllApps = it; refreshDock()
                 }
             }
             anyRows = added {

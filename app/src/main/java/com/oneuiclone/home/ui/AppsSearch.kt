@@ -32,6 +32,7 @@ import android.view.WindowInsets
 import android.view.WindowInsetsAnimation
 import android.view.WindowInsetsAnimationControlListener
 import android.view.WindowInsetsAnimationController
+import android.view.animation.AnimationUtils
 import android.view.animation.LinearInterpolator
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
@@ -49,11 +50,13 @@ import java.net.URLEncoder
 import java.text.Normalizer
 import java.util.Locale
 import java.util.concurrent.Executors
-import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.pow
 import kotlin.math.sin
+import kotlin.math.cos
+import kotlin.math.ln
+import kotlin.math.sqrt
 import kotlin.math.roundToInt
 
 /**
@@ -90,6 +93,8 @@ class AppsSearch(
     private val sources: SearchSources,
     /** Apps already on Home page 1 (its icons, folders and the dock): left out of the most-used row. */
     private val firstPage: () -> Set<AppKey>,
+    /** The blurred wallpaper the open bar is frosted with (fixed to the window); null for a plain translucent bar. */
+    private val glass: WidgetGlass? = null,
     /** Contacts: the launcher starts [Intent] with its open animation. */
     private val onOpenIntent: (View, Intent) -> Unit,
     private val onRequestContacts: () -> Unit,
@@ -151,28 +156,145 @@ class AppsSearch(
     private lateinit var origin: Origin
     /** The bar carries a blur ([layoutPill], a fading bar in Lift-Off). */
     private var pillBlurred = false
-    /** Glass drawn under the pill's fill while it morphs ([Origin.glass]). */
+    /** Glass drawn under the pill's fill: the pill's own ([Origin.glass]), else the bar's frost ([glass]). */
     private var pillGlass: WidgetGlass? = null
+    /** How much of [pillGlass] shows (0..1): a pill without glass gains it as it grows into the frosted bar. */
+    private var glassAlpha = 0f
+    /** The frosted bar's top-lit rim (0..1), coming in with the morph. */
+    private var sheen = 0f
+    /**
+     * How much of the Apps screen's dim ([FROST_DIM]) lies over the glass (0..1): it comes and goes with the morph,
+     * so a pill landing on Home's (whose glass has no dim) matches it exactly. 0.215–0.225 dimmed Home-glass pills all the
+     * way down, and the bar snapped 16 % lighter as Home's own pill took over (user video 6924).
+     */
+    private var frostDim = 0f
+    /** The frosted bar's ink ([pickFrostInk]): its hint and glyph, and the typed text. */
+    private var frostHint = colors.hint
+    private var frostText = colors.text
+    /** Where the pill was last drawn on screen: the glass is fixed to the window, so moving means redrawing. */
+    private val pillAt = android.graphics.Matrix()
+    private val pillNow = android.graphics.Matrix()
 
     /**
      * The pill's background: [pillGlass] (fixed to the window, like the Home pill it grows from) in the pill's shape,
-     * then the fill and stroke. The open bar's fill is nearly opaque, so the glass fades out under it on its own.
+     * then the fill and stroke, then a rim lit from above that makes the open bar read as a pane of frosted glass.
      */
     private inner class GlassPill : android.graphics.drawable.DrawableWrapper(pillBg) {
         private val glassPaint = GlassPaint()
-        private val toWindow = android.graphics.Matrix()
         private val rect = RectF()
+        private val rimMatrix = android.graphics.Matrix()
+        private val dim = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF000000.toInt() }
+        /** A unit-tall gradient, stretched to the pill each frame (its height changes all through the morph). */
+        private val rim = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            style = android.graphics.Paint.Style.STROKE
+            strokeWidth = dp.dp(1f)
+            shader = android.graphics.LinearGradient(0f, 0f, 0f, 1f, intArrayOf(colors.frostStroke, 0x0DFFFFFF, 0x1AFFFFFF),
+                floatArrayOf(0f, 0.55f, 1f), Shader.TileMode.CLAMP)
+        }
         override fun draw(canvas: android.graphics.Canvas) {
-            pillGlass?.let { g ->
-                toWindow.reset(); pill.transformMatrixToGlobal(toWindow)
-                if (glassPaint.aim(g, toWindow)) {
-                    rect.set(bounds)
-                    canvas.drawRoundRect(rect, pillBg.cornerRadius, pillBg.cornerRadius, glassPaint.paint)
-                }
+            val r = pillBg.cornerRadius
+            pillAt.reset(); pill.transformMatrixToGlobal(pillAt)
+            val g = pillGlass
+            if (g != null && glassAlpha > 0f && glassPaint.aim(g, pillAt)) {
+                glassPaint.paint.alpha = (glassAlpha * 255).roundToInt()
+                rect.set(bounds)
+                canvas.drawRoundRect(rect, r, r, glassPaint.paint)
+                // the Apps screen's dim, so the frost sits on the same scene as the blur around it
+                dim.alpha = (frostDim * FROST_DIM * 255).roundToInt()
+                canvas.drawRoundRect(rect, r, r, dim)
             }
             super.draw(canvas)
+            if (sheen > 0f) {
+                val half = rim.strokeWidth / 2f
+                rect.set(bounds); rect.inset(half, half)
+                rimMatrix.setScale(1f, rect.height()); rimMatrix.postTranslate(0f, rect.top)
+                rim.shader.setLocalMatrix(rimMatrix)
+                rim.alpha = (sheen * 255).roundToInt()
+                canvas.drawRoundRect(rect, r - half, r - half, rim)
+            }
         }
     }
+
+    // the glass redraws the views it lists when it's rebuilt (a new wallpaper)
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        glass?.views?.add(pill)
+    }
+
+    override fun onDetachedFromWindow() {
+        glass?.views?.remove(pill)
+        super.onDetachedFromWindow()
+    }
+
+    /**
+     * The frosted bar's ink for where it rests: white over most wallpapers, like the Home pill and the results; dark
+     * when the frost there comes out bright enough that white would wash out.
+     */
+    private fun pickFrostInk(animate: Boolean = false) {
+        val night = (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
+        val light = !night && frostLuminance() > FROST_DARK_INK_ABOVE
+        val hint = if (light) FROST_HINT_DARK else FROST_HINT
+        val text = if (light) colors.text else FROST_TEXT
+        inkAnim?.cancel()
+        if (!animate || (hint == frostHint && text == frostText)) {
+            frostHint = hint; frostText = text
+            field.setTextColor(text)
+            return
+        }
+        // the bar settled somewhere else (no keyboard after all): its ink crossfades instead of flipping
+        val fromHint = frostHint; val fromText = frostText
+        inkAnim = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = FADE_MS
+            interpolator = Easing.BASIC
+            addUpdateListener {
+                val t = it.animatedFraction
+                frostHint = argb.evaluate(t, fromHint, hint) as Int
+                frostText = argb.evaluate(t, fromText, text) as Int
+                field.setTextColor(frostText)
+                layoutPill()
+            }
+            start()
+        }
+    }
+    private var inkAnim: ValueAnimator? = null
+
+    /** Relative luminance (0..1) of the frost where the bar comes to rest ([kbTarget]): the glass there, dimmed, under [frostTint]. */
+    private fun frostLuminance(): Float {
+        val gl = glass ?: return 0f
+        val b = gl.bitmap ?: return 0f                            // no glass: the frost is over the apps screen's dimmed blur
+        val s = gl.scale
+        val top = barTop(kbTarget, dp.searchBarHeight.toFloat())
+        val x0 = (dp.dp(16f) / s).toInt().coerceIn(0, b.width - 1)
+        val x1 = ((dp.widthPx - dp.dp(16f)) / s).toInt().coerceIn(x0 + 1, b.width)
+        val y0 = (top / s).toInt().coerceIn(0, b.height - 1)
+        val y1 = ((top + dp.searchBarHeight) / s).toInt().coerceIn(y0 + 1, b.height)
+        val tint = frostTint()
+        val a = android.graphics.Color.alpha(tint) / 255f
+        fun lin(c: Float) = if (c <= 0.04045f) c / 12.92f else ((c + 0.055f) / 1.055f).pow(2.4f)
+        val tr = android.graphics.Color.red(tint) / 255f; val tg = android.graphics.Color.green(tint) / 255f; val tb = android.graphics.Color.blue(tint) / 255f
+        var sum = 0f; var n = 0
+        val stepX = maxOf(1, (x1 - x0) / 24); val stepY = maxOf(1, (y1 - y0) / 4)
+        var y = y0
+        while (y < y1) {
+            var x = x0
+            while (x < x1) {
+                val p = b.getPixel(x, y)
+                // the dim and the tint over the glass, then to linear light
+                val k = (1 - FROST_DIM) * (1 - a)
+                val r = lin(android.graphics.Color.red(p) / 255f * k + tr * a)
+                val g = lin(android.graphics.Color.green(p) / 255f * k + tg * a)
+                val bl = lin(android.graphics.Color.blue(p) / 255f * k + tb * a)
+                sum += 0.2126f * r + 0.7152f * g + 0.0722f * bl; n++
+                x += stepX
+            }
+            y += stepY
+        }
+        return if (n == 0) 0f else sum / n
+    }
+
+    /** The open bar's tint: lighter over the glass, milkier without it. */
+    private fun frostTint() = if (glass?.bitmap != null) colors.frost else colors.frostBare
     var isOpen = false; private set
 
     /** Morph progress: 0 = [origin], 1 = full-width bar on the keyboard. */
@@ -191,9 +313,20 @@ class AppsSearch(
     private var imeControl: WindowInsetsAnimationController? = null
     private var imeCancel: CancellationSignal? = null
     private var imeTries = 0
-    /** The bar's landing bounce ([bounceBar]): px above where it rests. */
-    private var barBounce = 0f
+    /**
+     * The bar's landing bounce ([bounceBar]): the overshoot asked for (px), until the bar's own spring takes over
+     * from the lift; then [bounceAnim] runs that spring (from [bounceD0] px below its rest at [bounceV0] px/s, at
+     * [bounceT0] ms).
+     */
+    private var bounceWant = 0f
+    private var bounceD0 = 0f
+    private var bounceV0 = 0f
+    private var bounceT0 = 0L
     private var bounceAnim: ValueAnimator? = null
+    /** The bar's way in without the bounce: its top (px) at the first layout of the last frame ([baseAt], ms), and its speed (px/s, down). */
+    private var baseTop = Float.NaN
+    private var baseAt = 0L
+    private var baseV = Float.NaN
     /** A keyboard handed over late eases onto the finger's height instead of jumping there. */
     private var imeBlend = 1f
     private var imeBlendAnim: ValueAnimator? = null
@@ -760,7 +893,7 @@ class AppsSearch(
         // a fading bar comes and goes with the results: in Lift-Off it rises (or drops), grows, sharpens and fades in
         // exactly as they do; otherwise it fades with the morph's progress
         val q = if (o.fade && isLifting) liftFocus(f) else 1f
-        pill.y = top - barBounce + dp.dp(LIFT_RISE_DP) * (1f - q) * liftSign
+        pill.y = landed(top) + dp.dp(LIFT_RISE_DP) * (1f - q) * liftSign
         pill.alpha = if (!o.fade) 1f else if (isLifting) liftFade(f) else f
         val sc = 0.92f + 0.08f * q
         pill.scaleX = sc; pill.scaleY = sc
@@ -769,13 +902,20 @@ class AppsSearch(
         if (blur >= 0.5f) { pill.setRenderEffect(RenderEffect.createBlurEffect(blur, blur, Shader.TileMode.DECAL)); pillBlurred = true }
         else if (pillBlurred) { pill.setRenderEffect(null); pillBlurred = false }
         pillBg.cornerRadius = h / 2f
-        pillBg.setColor(argb.evaluate(g, o.fill, colors.open) as Int)
-        pillBg.setStroke(dp.dpi(1f), argb.evaluate(g, o.stroke, colors.stroke) as Int)
-        // the pill's own look at the start and end: its glass under the fill, and its ink fading into the bar's
-        pillGlass = o.glass
-        val ink = argb.evaluate(g, o.ink ?: colors.hint, colors.hint) as Int
+        // frosted glass: a pill with its own glass (Home's) keeps it all the way; one without (the Apps screen's) has
+        // the glass come up under its fill as the fill thins, so it's solid where it lands and frosted when open
+        pillBg.setColor(argb.evaluate(g, o.fill, frostTint()) as Int)
+        pillBg.setStroke(dp.dpi(1f), argb.evaluate(g, o.stroke, 0x14FFFFFF) as Int)
+        pillGlass = o.glass ?: glass
+        glassAlpha = if (o.glass != null) 1f else g
+        frostDim = g
+        sheen = g
+        val ink = argb.evaluate(g, o.ink ?: colors.hint, frostHint) as Int
         glyph.color = ink
         field.setHintTextColor(ink)
+        // the glass is fixed to the window: wherever the pill moves (keyboard, bounce, lift), it's redrawn there
+        pillNow.reset(); pill.transformMatrixToGlobal(pillNow)
+        if (pillNow != pillAt) pill.invalidate()
         // search_bar_elevation; a fading bar's shadow (drawn sharp, never blurred) comes in only as the bar sharpens
         pill.elevation = lerp(o.elevation, dp.dp(8f), g) * q
         val gs = lerp(o.glyphBox, openGlyphBox, g) / openGlyphBox
@@ -804,6 +944,7 @@ class AppsSearch(
         kbTarget = h
         kbAnim?.cancel()
         updateContentInset()
+        if (isOpen) pickFrostInk(animate = true)          // it rests somewhere else now: the frost there may differ
         if (isOpen) render()                           // more or less room: refit
         if (duration <= 0L) { kb = h; layoutPill(); return }
         kbAnim = ValueAnimator.ofFloat(kb, h).apply {
@@ -824,6 +965,7 @@ class AppsSearch(
         isOpen = true
         visibility = VISIBLE
         kb = rememberedKeyboard(); kbTarget = kb
+        pickFrostInk()
         f = 0f
         layoutPill()
         updateContentInset()
@@ -890,7 +1032,7 @@ class AppsSearch(
     /** No longer open: pending work stops and the keyboard goes down. */
     private fun shutDown() {
         isOpen = false
-        bounceAnim?.cancel(); barBounce = 0f
+        bounceWant = 0f; bounceAnim?.cancel()
         main.removeCallbacks(noKeyboard)
         main.removeCallbacks(keyboardRetry)
         pendingFetch?.let { main.removeCallbacks(it) }
@@ -928,6 +1070,7 @@ class AppsSearch(
         liftSign = if (fromAbove) -1f else 1f
         visibility = VISIBLE
         kb = rememberedKeyboard(); kbTarget = kb
+        pickFrostInk()
         updateContentInset()
         opening = true
         filter("")
@@ -987,6 +1130,7 @@ class AppsSearch(
             isLifting = false
             clearLiftLook()
             f = 1f; layoutPill()
+            bounceWant = 0f                                          // landed without the bar taking over: no late bounce
             imeBlendAnim?.cancel()
             val c = imeControl
             if (c != null) c.finish(true)
@@ -1002,27 +1146,78 @@ class AppsSearch(
     }
 
     /**
-     * The bar overshoots its resting place by [amount] px and settles: one damped wobble (peak after 60 ms, a dip
-     * of a fifth of it below, still by 0.5 s).
+     * The bar will overshoot its resting place by about [amount] px as it lands (0: no bounce). It isn't added
+     * after the landing (that read as a second push once everything had stopped): while the lift carries it in,
+     * the bar hands itself over to its own looser spring, keeping its speed, at the moment that spring would
+     * overshoot by [amount]. So it sails past the keyboard's stop and settles back as everything else arrives.
      */
     fun bounceBar(amount: Float) {
         bounceAnim?.cancel()
+        baseTop = Float.NaN; baseV = Float.NaN
         // a fading bar never travelled, so it has nothing to land from
-        if (amount < 0.5f || !isOpen || (::origin.isInitialized && origin.fade)) return
-        field.isCursorVisible = false
-        bounceAnim = ValueAnimator.ofFloat(0f, BOUNCE_S).apply {
-            duration = (BOUNCE_S * 1000).toLong()
+        bounceWant = if (amount < 0.5f || !isOpen || (::origin.isInitialized && origin.fade)) 0f else amount
+        if (bounceWant > 0f) field.isCursorVisible = false
+    }
+
+    /** The bar at [top] (where the lift and keyboard put it), or where its own landing spring has it. */
+    private fun landed(top: Float): Float {
+        val rest = barTop(kb, dp.searchBarHeight.toFloat())
+        val now = AnimationUtils.currentAnimationTimeMillis()
+        if (bounceWant > 0f && bounceAnim == null) {
+            // speed: from the first layout of one frame to the next (the lift and the keyboard each lay it out)
+            if (baseTop.isNaN()) { baseTop = top; baseAt = now }
+            else if (now > baseAt) {
+                val v = (top - baseTop) * 1000f / (now - baseAt)
+                baseV = if (baseV.isNaN()) v else baseV + (v - baseV) * 0.5f
+                baseTop = top; baseAt = now
+                if (overshoot(top - rest, baseV) <= bounceWant) startLanding(top - rest, baseV, now)
+            }
+        }
+        if (bounceAnim == null) return top
+        val y = rest + landing(bounceD0, bounceV0, (now - bounceT0) / 1000f)
+        // never lower than the lift and keyboard put it (a taller keyboard than remembered still pushes it up),
+        // except for the spring's small dip below its rest after the overshoot
+        return minOf(top + maxOf(0f, y - rest), y)
+    }
+
+    private fun startLanding(d0: Float, v0: Float, now: Long) {
+        bounceWant = 0f
+        bounceD0 = d0; bounceV0 = v0; bounceT0 = now
+        val wd = BAR_LAND_OMEGA * sqrt(1f - BAR_LAND_ZETA * BAR_LAND_ZETA)
+        val reach = maxOf(abs(d0), abs((v0 + BAR_LAND_ZETA * BAR_LAND_OMEGA * d0) / wd), 0.3f)
+        // still until it's within 0.3 px
+        val settle = (ln(reach / 0.3f) / (BAR_LAND_ZETA * BAR_LAND_OMEGA)).coerceIn(0.2f, 0.9f)
+        bounceAnim = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 2000L
             interpolator = LinearInterpolator()
             addUpdateListener {
-                val t = it.animatedValue as Float
-                barBounce = amount * exp(-t / BOUNCE_DECAY_S) * sin(2f * PI.toFloat() * t / BOUNCE_PERIOD_S) / BOUNCE_PEAK
                 layoutPill()
+                // the lift may still be easing out (the bar is held at it): end only once it is done
+                if ((AnimationUtils.currentAnimationTimeMillis() - bounceT0) / 1000f >= settle && !isLifting) it.cancel()
             }
             addListener(object : AnimatorListenerAdapter() {
-                override fun onAnimationEnd(animation: Animator) { barBounce = 0f; layoutPill(); showCursor() }
+                override fun onAnimationEnd(animation: Animator) {
+                    if (bounceAnim !== animation) return
+                    bounceAnim = null; layoutPill(); showCursor()
+                }
             })
             start()
         }
+    }
+
+    /** The bar's landing spring, [t] s after it took over from [d0] px below its rest moving at [v0] px/s (down): px below its rest. */
+    private fun landing(d0: Float, v0: Float, t: Float): Float {
+        val zw = BAR_LAND_ZETA * BAR_LAND_OMEGA
+        val wd = BAR_LAND_OMEGA * sqrt(1f - BAR_LAND_ZETA * BAR_LAND_ZETA)
+        return exp(-zw * t) * (d0 * cos(wd * t) + (v0 + zw * d0) / wd * sin(wd * t))
+    }
+
+    /** How far past its rest the landing spring would carry a bar [d0] px below it moving at [v0] px/s (down). */
+    private fun overshoot(d0: Float, v0: Float): Float {
+        var low = 0f
+        var t = 0f
+        while (t < 0.6f) { low = minOf(low, landing(d0, v0, t)); t += 0.004f }
+        return -low
     }
 
     /** The typing cursor, once the bar has stopped moving (morph, results, lift and landing bounce all done). */
@@ -1136,12 +1331,22 @@ class AppsSearch(
         /** Requests for the keyboard, 50 ms apart, before it is left to come up by itself. */
         private const val IME_CONTROL_TRIES = 12
         private const val IME_BLEND_MS = 180L
-        /** [bounceBar]'s wobble: e^(−t/decay)·sin(2πt/period), scaled so its first peak is the amount asked for. */
-        private const val BOUNCE_S = 0.5f
-        private const val BOUNCE_DECAY_S = 0.11f
-        private const val BOUNCE_PERIOD_S = 0.34f
-        private const val BOUNCE_PEAK = 0.519f
+        /**
+         * [bounceBar]'s landing spring (stiffness ~1000, ζ 0.7): firm enough that the bar takes itself over while
+         * still moving fast (2–3 px/ms on a Pixel 10 Pro XL) and peaks before the keyboard stops; one overshoot, no
+         * visible dip. 0.190's loose wobble (ζ 0.44) started only once the lift had all but stopped (user: the
+         * bounce "happens after the animation is supposed to be over").
+         */
+        private const val BAR_LAND_OMEGA = 32f
+        private const val BAR_LAND_ZETA = 0.7f
         private const val FADE_MS = 150L
+        /** The frosted bar's ink: white (as the Home pill and the results), or dark over frost brighter than this. */
+        private const val FROST_DARK_INK_ABOVE = 0.30f
+        /** The Apps screen's dim (#A6000000 at 25 %) laid over the frost's glass. */
+        private const val FROST_DIM = 0.16f
+        private const val FROST_HINT = 0xD9FFFFFF.toInt()
+        private const val FROST_TEXT = 0xFFFFFFFF.toInt()
+        private const val FROST_HINT_DARK = 0xFF48484D.toInt()
         /** How long [askForKeyboard] keeps trying (the IME hand-over from an app has taken ~400 ms). */
         private const val KEYBOARD_RETRY_MS = 1500L
         private val R_ENTERABLE = com.oneuiclone.home.R.id.search_enterable

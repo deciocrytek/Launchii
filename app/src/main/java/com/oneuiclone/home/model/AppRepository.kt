@@ -63,6 +63,8 @@ class AppRepository(private val context: Context, private val iconFactory: IconF
     @Volatile var comicBorder = true
     /** Whether the app's own icons were last drawn with their shine (IconFactory reads IconFactory.iconShine as it draws). */
     @Volatile var iconShine = true
+    /** The Themed / Frosted colour the icons were last drawn in (IconFactory reads IconFactory.themeColor as it draws; 0 = palette). */
+    @Volatile var themeColor = 0
     /** Glass icons: how opaque a themed icon's plate is (1 = solid). */
     @Volatile var plateAlpha = 1f
 
