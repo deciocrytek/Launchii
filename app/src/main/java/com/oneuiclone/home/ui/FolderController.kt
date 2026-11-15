@@ -261,7 +261,7 @@ class FolderController(
         source?.let { s ->
             val key = dragged.appInfo?.key
             if (s is LargeFolderIconView) s.apps = s.apps.filter { (it.second as? AppInfo)?.key != key }
-            else s.previews = p.gridIcons().filter { it !== dragged }.mapNotNull { it.icon }
+            else s.previews = p.gridIcons().filter { it !== dragged }.mapNotNull { it.appInfo?.previewIcon ?: it.icon }
             s.previewAlpha = 1f; s.containerAlpha = 1f
         }
         val home = homeContent()
@@ -379,7 +379,8 @@ class FolderController(
             icon.childRect(slot, previewRect)
             previewRect.offset(iconRect.left.toFloat(), iconRect.top.toFloat())
             val to = RectF(p.iconRectInPanel(target))
-            val fly = FlyingIcon(context, target.icon)
+            // (with the see-through themes the closed folder shows the symbol alone: AppInfo.previewIcon)
+            val fly = FlyingIcon(context, target.icon, target.appInfo?.previewIcon)
             overlay.addView(fly, FrameLayout.LayoutParams(dp.iconSizePx, dp.iconSizePx))
             fliers += Flier(fly, RectF(previewRect), to)
             target.iconVisible = false
@@ -439,6 +440,7 @@ class FolderController(
                     fl.view.x = l; fl.view.y = tp
                     val sc = w / dp.iconSizePx
                     fl.view.scaleX = sc; fl.view.scaleY = sc
+                    fl.view.mix = e.coerceIn(0f, 1f)
                 }
                 // labels & other content of the panel
                 val content = if (open) content0 + (1f - content0) * (if (popup) (ms - 100f) / 200f else (ms - 40f) / 200f).coerceIn(0f, 1f)
@@ -499,12 +501,24 @@ class FolderController(
         }
     }
 
-    /** Bitmap-only icon used for the flight, cut to the icon shape (the Pixel 10's white corners, 0.181). */
-    private class FlyingIcon(context: Context, private val bmp: Bitmap?) : View(context) {
+    /**
+     * Bitmap-only icon used for the flight, cut to the icon shape (the Pixel 10's white corners, 0.181). With a
+     * different [preview] (the closed folder's symbol alone, for Frosted and Clear Colour) it turns from that into
+     * [bmp] as the folder opens ([mix] 0 at the folder icon, 1 in the open folder), so the plates fade in and out with
+     * the flight rather than snapping away as the close lands (user, 0.244).
+     */
+    private class FlyingIcon(context: Context, private val bmp: Bitmap?, preview: Bitmap? = null) : View(context) {
         private val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
         private val shaped = com.oneuiclone.home.icons.ShapedIcon()
+        private val preview = preview?.takeIf { it !== bmp }
+        var mix = 1f
+            set(v) { if (field != v) { field = v; if (preview != null) invalidate() } }
         override fun onDraw(canvas: Canvas) {
-            bmp?.let { shaped.draw(canvas, it, Rect(0, 0, width, height), paint) }
+            val dst = Rect(0, 0, width, height)
+            val p = preview
+            if (p == null) { paint.alpha = 255; bmp?.let { shaped.draw(canvas, it, dst, paint) }; return }
+            if (mix < 1f) { paint.alpha = (255 * (1f - mix)).toInt(); shaped.draw(canvas, p, dst, paint) }
+            if (mix > 0f) { paint.alpha = (255 * mix).toInt(); bmp?.let { shaped.draw(canvas, it, dst, paint) } }
         }
     }
 

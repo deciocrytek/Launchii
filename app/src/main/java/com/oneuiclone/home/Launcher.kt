@@ -706,6 +706,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
                     else widgets.createView(activity, item.appWidgetId, dp, item.sx, item.sy)) ?: continue
                 val wc = com.oneuiclone.home.ui.WidgetContainer(activity, item, hv, dp.widgetPaddingPx)
                 applyWidgetStyle(wc)
+                applyWidgetAlign(wc)
                 wc.onLongPress = { showWidgetOptions(it) }
                 wc.onDragStart = { c, x, y ->
                     if (prefs.lockLayout || edit.isActive) false else {
@@ -750,12 +751,22 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         )
         // the Bubbles, Bubble and Split widgets are drawn as icons, so they follow the icon style instead of having their own
         if (!iconLike) opts += com.oneuiclone.home.ui.QuickOption("Style", com.oneuiclone.home.ui.QuickOption.STYLE) { showWidgetStyle(wc) }
-        // the 2×1 pill: centred in its row like other widgets, or level with the icons beside it
-        (wc.getChildAt(0) as? com.oneuiclone.home.ui.QuickOpenPairView)?.let { pair ->
+        // centred in its rows, or level with the icons beside it. The 2×1 pill keeps its own setting (it moves the
+        // pill inside its view); the Bubbles widget is a labelled icon already, so it's always level with them.
+        val pair = wc.getChildAt(0) as? com.oneuiclone.home.ui.QuickOpenPairView
+        if (pair != null) {
             opts += com.oneuiclone.home.ui.QuickOption(if (pair.centred) "Align with icons" else "Centre in row",
                 com.oneuiclone.home.ui.QuickOption.STYLE) {
                 pair.centred = !pair.centred
                 com.oneuiclone.home.widgets.QuickOpenWidget.setPairCentred(activity, wc.item.appWidgetId, pair.centred)
+            }
+        } else if (!bubbles) {
+            val styles = com.oneuiclone.home.widgets.WidgetStyles
+            val aligned = styles.iconAligned(activity, wc.item.appWidgetId)
+            opts += com.oneuiclone.home.ui.QuickOption(if (aligned) "Centre in row" else "Align with icons",
+                com.oneuiclone.home.ui.QuickOption.STYLE) {
+                styles.setIconAligned(activity, wc.item.appWidgetId, !aligned)
+                applyWidgetAlign(widgetContainer(wc.item.appWidgetId) ?: wc)
             }
         }
         if (info?.configure != null) {
@@ -802,7 +813,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         // the apps' own icons unless Icons › Apply to Apps screen and search is on, so they're quick to tell apart
         val themed = appsScreenThemed
         val icons = bw.apps(activity, item.appWidgetId).mapNotNull { repo?.get(it)?.let { a -> if (themed) a.icon else a.drawerIcon } }.take(bw.MAX)
-        val minimal = themed && prefs.themedIcons && prefs.minimalIcons
+        val minimal = themed && prefs.themedIcons && (prefs.minimalIcons || prefs.iconLook == com.oneuiclone.home.icons.IconFactory.LOOK_MINIMAL_COLOUR)
         val stencil = themed && prefs.themedIcons && prefs.iconLook == com.oneuiclone.home.icons.IconFactory.LOOK_STENCIL
         val layers = bubbleLayers[item.appWidgetId]?.takeIf { old -> old.size == icons.size &&
             old.indices.all { old[it].icon === icons[it] && old[it].cut == minimal && (old[it].hole != null) == stencil } }
@@ -841,9 +852,18 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
     /** The Bubble / Split widgets' and panel's frosted tint (QuickOpenWidget.frost). */
     private fun quickOpenFrost() = com.oneuiclone.home.widgets.QuickOpenWidget.frost(activity, iconFactory.isNight(), prefs.iconPlateAlpha)
 
+    /**
+     * The tint of Launchii's widgets on Home (the Bubble and Split tiles and pill) and of folders: with a see-through
+     * theme (Frosted, Clear Colour) the Icon colour exactly as see-through as the icons' plates ([Prefs.iconTintAlpha];
+     * the user, 0.248: match the icons exactly, not [quickOpenFrost]'s clamped tint, which the panel keeps); otherwise
+     * [quickOpenFrost].
+     */
+    private fun homeTint(): Int = if (!prefs.seeThroughPlates) quickOpenFrost() else
+        (com.oneuiclone.home.icons.IconFactory.themeAccent(activity) and 0x00FFFFFF) or ((prefs.iconTintAlpha.coerceIn(0f, 1f) * 255).toInt() shl 24)
+
     /** A Bubble or Split widget's tile, in the folders' and widgets' shape. */
     private fun quickOpenTile(kind: com.oneuiclone.home.widgets.QuickOpenWidget.Kind) = com.oneuiclone.home.widgets.QuickOpenWidget.tile(
-        kind, dp.iconSizePx, quickOpenFrost(), mask = com.oneuiclone.home.icons.IconShape.path(dp.iconSizePx.toFloat(), com.oneuiclone.home.icons.IconShape.container))
+        kind, dp.iconSizePx, homeTint(), mask = com.oneuiclone.home.icons.IconShape.path(dp.iconSizePx.toFloat(), com.oneuiclone.home.icons.IconShape.container))
 
     /** The Bubble or Split widget on Home: its tile alone (no name), centred in its cell; a tap opens its panel ([openQuickOpen]). */
     private fun quickOpenView(kind: com.oneuiclone.home.widgets.QuickOpenWidget.Kind): IconView =
@@ -876,7 +896,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
 
     /** The 2×1 Bubble & Split widget on Home: one frosted pill, each half opening its own panel, which Home zooms out behind. */
     private fun quickPairView(appWidgetId: Int): com.oneuiclone.home.ui.QuickOpenPairView =
-        com.oneuiclone.home.ui.QuickOpenPairView(activity, dp, quickOpenFrost()).apply {
+        com.oneuiclone.home.ui.QuickOpenPairView(activity, dp, homeTint()).apply {
             glass = widgetGlass
             centred = com.oneuiclone.home.widgets.QuickOpenWidget.pairCentred(activity, appWidgetId)
             label = ""
@@ -983,6 +1003,13 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         hv.glass = if (t == null) null else widgetGlass
     }
 
+    /** Widget long-press › Align with icons / Centre in row: with Home labels off the icons are centred, so is it. */
+    private fun applyWidgetAlign(wc: com.oneuiclone.home.ui.WidgetContainer) {
+        if (wc.getChildAt(0) is com.oneuiclone.home.ui.QuickOpenPairView || wc.item.provider == bubblesProvider) return
+        val aligned = prefs.homeLabels && com.oneuiclone.home.widgets.WidgetStyles.iconAligned(activity, wc.item.appWidgetId)
+        wc.lift = if (aligned) kotlin.math.round(com.oneuiclone.home.ui.IconView.labelLift(activity, dp)).toInt() else 0
+    }
+
     /** Widget long-press › Style (also saves the widget's diagnostics file). */
     private fun showWidgetStyle(wc: com.oneuiclone.home.ui.WidgetContainer) {
         resizeFrame?.dismiss()
@@ -1026,6 +1053,16 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
 
     /** A folder's saved style on its closed icon: Blur shows the blurred wallpaper under its colour, faded by the transparency. */
     private fun applyFolderStyle(icon: FolderIconView, folder: HomeItem.Folder) {
+        // the see-through themes (Frosted, Clear Colour): a folder with no colour of its own is frosted as the icons
+        // are: the Icon colour exactly as see-through as their plates (Clear Colour's veil on average, as it lightens
+        // toward the foot), over the glass, so it matches the icons round it (user, 0.245; 0.246: 0.245 used the
+        // Bubble and Split tiles' tint, clamped, which came out heavier than the icons)
+        if (folder.color == 0 && prefs.seeThroughPlates) {
+            icon.bgColor = homeTint()
+            icon.fillOpacity = 1f
+            icon.glass = widgetGlass
+            return
+        }
         val t = com.oneuiclone.home.widgets.WidgetStyles.folderTransparency(activity, folder.id)
         icon.fillOpacity = if (t == null) 1f else 1f - t / 100f
         icon.glass = if (t == null) null else widgetGlass
@@ -1137,7 +1174,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             com.oneuiclone.home.ui.LargeFolderIconView(activity, dp).apply {
                 this.item = item
                 label = item.title
-                apps = content.map { it.icon to it }
+                apps = content.map { it.previewIcon to it }
                 if (item.color != 0) bgColor = item.color
                 applyFolderStyle(this, item)
                 setOnClickListener {
@@ -1151,7 +1188,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             FolderIconView(activity, dp).apply {
                 this.item = item
                 label = item.title
-                previews = content.map { it.icon }
+                previews = content.map { it.previewIcon }
                 if (item.color != 0) bgColor = item.color
                 applyFolderStyle(this, item)
                 setOnClickListener {
@@ -1797,7 +1834,8 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         // a see-through (glass) icon: the card comes in half see-through too, so it grows out of the glass
         val glass = v.plateGlass != null && v.icon === app.icon && app.icon !== app.drawerIcon
         // a Minimal icon has no plate: the card starts invisible behind the glyph and fills in as it grows
-        val minimal = prefs.themedIcons && prefs.minimalIcons && v.icon === app.icon && app.icon !== app.drawerIcon
+        val minimal = prefs.themedIcons && (prefs.minimalIcons || prefs.iconLook == com.oneuiclone.home.icons.IconFactory.LOOK_MINIMAL_COLOUR) &&
+            v.icon === app.icon && app.icon !== app.drawerIcon
         // a dark icon: the card starts as its dark plate
         val dark = prefs.darkIcons && v.icon === app.icon && app.icon !== app.drawerIcon
         // a Dot, Prism or Stencil icon: the card starts as its plate
@@ -1811,6 +1849,9 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             // a Stencil icon's cut-out shows the wallpaper: an opaque card under it would fill the symbol in at the tap
             look && prefs.iconLook == com.oneuiclone.home.icons.IconFactory.LOOK_STENCIL -> com.oneuiclone.home.ui.LaunchCard.STENCIL_FROM_ALPHA
             look && prefs.iconLook in com.oneuiclone.home.icons.IconFactory.PLAYFUL -> com.oneuiclone.home.ui.LaunchCard.PLAYFUL_FROM_ALPHA
+            // Clear Colour: as Themed's, the card starts see-through in the Icon colour (its glass's tint) and fills in,
+            // turning into the app's colour (user, 0.243)
+            look && prefs.iconLook == com.oneuiclone.home.icons.IconFactory.LOOK_CLEAR_COLOUR -> com.oneuiclone.home.ui.LaunchCard.THEMED_FROM_ALPHA
             glass -> com.oneuiclone.home.ui.LaunchCard.GLASS_FROM_ALPHA
             else -> 1f
         }
@@ -1818,6 +1859,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             when {
                 dark -> com.oneuiclone.home.icons.IconFactory.DARK_PLATE
                 themed -> com.oneuiclone.home.icons.IconFactory.themeAccent(activity)
+                look && prefs.iconLook == com.oneuiclone.home.icons.IconFactory.LOOK_CLEAR_COLOUR -> com.oneuiclone.home.icons.IconFactory.themeAccent(activity)
                 look -> com.oneuiclone.home.icons.IconFactory.lookCard(prefs.iconLook, com.oneuiclone.home.icons.IconFactory.lookNight(prefs.iconMode, iconFactory.isNight()))
                 else -> null
             })

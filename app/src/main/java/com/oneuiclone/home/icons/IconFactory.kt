@@ -112,6 +112,70 @@ class IconFactory(private val context: Context) {
          * parts fading into the plate); at night the symbol in the app's colour on a near-black plate. Modelled on iOS 26.
          */
         const val LOOK_IOS = "ios"
+        /**
+         * Icon theme › Clear Colour: each app's symbol in its own colours on clear frosted glass (Home draws the blurred
+         * wallpaper under it, as for Frosted). The same in light and dark mode. [createClearColour].
+         */
+        const val LOOK_CLEAR_COLOUR = "clearcolour"
+        /**
+         * Icon theme › Minimal Colour: Clear Colour's symbol alone, in its own colours, with no plate or glass behind it
+         * (as Minimal is Themed's white symbol alone). [createMinimalColour].
+         */
+        const val LOOK_MINIMAL_COLOUR = "minimalcolour"
+        /** The looks that show the blurred wallpaper under the icon (Prefs.iconGlass): Stencil's cut-out, Clear Colour's glass. */
+        val GLASS_LOOKS = setOf(LOOK_STENCIL, LOOK_CLEAR_COLOUR)
+        /**
+         * Its veil over the glass is the Icon colour (as Frosted's plate), the Icon transparency see-through at the top and
+         * fading to this share of that at the foot (0.231's white veil ran 30 % to 11 %); the glow along its top edge is white (16 %).
+         */
+        const val CLEAR_VEIL_FOOT = 0.37f
+        private const val CLEAR_GLOW = 0x29FFFFFF
+        /** The sheen over the symbol's top (27 % white), and its shadow's strength. */
+        private const val CLEAR_SHEEN = 0x45FFFFFF
+        private const val CLEAR_SHADOW = 0.26f
+        /** Chrome's logo radius, as a share of the icon. */
+        private const val CLEAR_CHROME_RADIUS = 0.3f
+        /** A foreground still covering more than this share of the icon once its plate's colour is cut out is the whole art: shown whole. */
+        private const val CLEAR_FULL_ART = 0.8f
+        /** Under this share left, the cut took the whole symbol. */
+        private const val CLEAR_EMPTY = 0.01f
+        /** clearArt: the outer ring it reads the background from (share of the icon from its centre). */
+        private const val ART_RING_IN = 0.40f
+        private const val ART_RING_OUT = 0.47f
+        /** A pixel counts as coloured above this chroma; a background is a hue when this share of the ring is coloured. */
+        private const val ART_CHROMA = 0.3f
+        private const val ART_COLOURED_RING = 0.4f
+        /** The most saturated share of the ring's main hue family that sets the background's hue and strength. */
+        private const val ART_KEY_SHARE = 0.4f
+        /** Background by hue: within [ART_HUE_NEAR]°, fading to art by [ART_HUE_FAR]°. By colour: distance [ART_DIST_NEAR]–[ART_DIST_FAR]. */
+        private const val ART_HUE_NEAR = 11f
+        private const val ART_HUE_FAR = 20f
+        /** …and with a colour as strong as the background's: art below [ART_WEAK] of its chroma, background above [ART_STRONG]. */
+        private const val ART_WEAK = 0.6f
+        private const val ART_STRONG = 0.8f
+        private const val ART_DIST_NEAR = 0.09f
+        private const val ART_DIST_FAR = 0.2f
+        /** The art must keep between these shares of the icon, or it's shown whole. */
+        private const val ART_MIN = 0.05f
+        private const val ART_MAX = 0.95f
+        /**
+         * The flood starts only from clear background ([ART_SEED] or less art) and steps only between neighbours this
+         * close in colour ([ART_STEP]), so it follows the background's smooth gradient but stops at the art's edge:
+         * 0.233–0.237 flooded on by key alone, into Mr. Monopoly's shaded ear and skin (user: "a bit transparent").
+         */
+        private const val ART_SEED = 0.2f
+        /** 0.240: tighter (was 0.05, and any pixel under 0.5 art), as the phone's Monopoly GO icon still lost its ear. */
+        private const val ART_STEP = 0.03f
+        private const val ART_PROP = 0.35f
+        /** [unmixEdges]: a pixel this see-through or more once keyed counts as cut. */
+        private const val UNMIX_CUT = 64
+        /** A symbol with at least this share of coloured pixels (chroma above [CLEAR_COLOURFUL_CHROMA]) keeps its own colours. */
+        private const val CLEAR_COLOURFUL_CHROMA = 0.25f
+        private const val CLEAR_COLOURFUL_SHARE = 0.15f
+        /** A plain symbol takes its plate's colours only from a plate darker than this (a pale plate wouldn't read on glass). */
+        private const val CLEAR_FILL_MAX_LUMINANCE = 0.75f
+        /** A plain symbol's black parts in its plate's colour at this brightness (white parts at full). */
+        private const val CLEAR_DEEP = 0.32f
         /** iOS Dark's plate, top to foot (measured), and its overall colour for the Zoom In card. */
         private const val IOS_DARK_TOP = 0xFF333333.toInt()
         private const val IOS_DARK_BOTTOM = 0xFF101010.toInt()
@@ -171,6 +235,7 @@ class IconFactory(private val context: Context) {
             LOOK_COMIC -> COMIC_INK
             LOOK_GROOVY -> if (night) GROOVY_PLATE_DARK else GROOVY_PLATE_LIGHT
             LOOK_IOS -> if (night) IOS_DARK_PLATE else Color.WHITE
+            LOOK_CLEAR_COLOUR, LOOK_MINIMAL_COLOUR -> Color.WHITE
             else -> if (night) PRISM_PLATE_DARK else PRISM_PLATE_LIGHT
         }
 
@@ -180,6 +245,10 @@ class IconFactory(private val context: Context) {
          */
         fun lookCard(look: String, night: Boolean): Int? = when {
             look == LOOK_IOS && !night -> null
+            // glass: the card grows out of it see-through, in the app's own splash colour, as from Frosted icons
+            look == LOOK_CLEAR_COLOUR -> null
+            // no plate: the card fills in from nothing behind the symbol (Launcher), in the app's splash colour
+            look == LOOK_MINIMAL_COLOUR -> null
             else -> lookPlate(look, night)
         }
 
@@ -280,6 +349,9 @@ class IconFactory(private val context: Context) {
             dark -> runCatching { createDark(d, size) }.onFailure { android.util.Log.w("IconFactory", "Dark icon failed: $pkg", it) }.getOrNull() ?: normal
             // Glass works from each app's own icon, so every app gets it, with a monochrome layer or not
             themed && look == LOOK_IOS -> runCatching { createIos(d, size, lookNight(lookMode, night), pkg) }.onFailure { android.util.Log.w("IconFactory", "Glass icon failed: $pkg", it) }.getOrNull() ?: normal
+            // Clear Colour also works from each app's own icon, so every app gets it
+            themed && look == LOOK_CLEAR_COLOUR -> runCatching { createClearColour(d, size, pkg, plateAlpha) }.onFailure { android.util.Log.w("IconFactory", "Clear Colour icon failed: $pkg", it) }.getOrNull() ?: normal
+            themed && look == LOOK_MINIMAL_COLOUR -> runCatching { createMinimalColour(d, size, pkg) }.onFailure { android.util.Log.w("IconFactory", "Minimal Colour icon failed: $pkg", it) }.getOrNull() ?: normal
             styled -> runCatching { createLook(d, size, lookNight(lookMode, night), look, hasMono, pkg?.hashCode() ?: 0) }.onFailure { android.util.Log.w("IconFactory", "$look icon failed: $pkg", it) }.getOrNull() ?: normal
             themed && minimal && hasMono -> createMinimal(d, size)
             themed && minimal && (themeAll || forced) -> createTonal(d, size, night, glyphOnly = true)
@@ -1043,6 +1115,300 @@ class IconFactory(private val context: Context) {
         iosRim(c, size, if (night && !game) IOS_RIM_DARK else IOS_RIM_LIGHT, IOS_RIM_WIDTH)
         return clip(layers, size)
     }
+
+    /**
+     * Icon theme › Clear Colour ([LOOK_CLEAR_COLOUR]): each app's symbol in its own colours on clear frosted glass: a
+     * veil in the Icon colour, [plateAlpha] opaque (Icons › Icon transparency, as Frosted's plate) and lighter toward
+     * the foot, over the blurred wallpaper Home draws under the icon (IconView.plateGlass, as for Frosted), with a soft
+     * lift under the symbol. Its edge is Default icons' contour (applyEmboss, Icons › Icon contour); 0.231's white rim
+     * went in 0.234. The same in light and dark mode. Mockup A of
+     * mockups/frosted-colour-2.html. Recolouring is in [clearGlyph].
+     */
+    fun createClearColour(src: Drawable, size: Int, pkg: String?, plateAlpha: Float = 1f): Bitmap {
+        val s = size.toFloat()
+        val layers = blank(size)
+        val c = Canvas(layers)
+        val veil = accent() and 0x00FFFFFF
+        val top = plateAlpha.coerceIn(0f, 1f)
+        fun at(a: Float) = veil or ((a * 255).roundToInt() shl 24)
+        c.drawPaint(Paint().apply {
+            shader = android.graphics.LinearGradient(0f, 0f, 0f, s, at(top), at(top * CLEAR_VEIL_FOOT), Shader.TileMode.CLAMP)
+        })
+        // a soft glow along the top edge, as light catching the glass
+        c.drawPaint(Paint().apply {
+            shader = android.graphics.RadialGradient(s / 2f, 0f, s * 0.75f, intArrayOf(CLEAR_GLOW, 0x00FFFFFF), null, Shader.TileMode.CLAMP)
+        })
+        val glyph = clearGlyph(src, size, pkg) ?: clearArt(src, size) ?: run {
+            // art with no background to take away (a photo, a busy scene): its own icon, whole
+            layers.eraseColor(Color.TRANSPARENT)
+            ownIcon(c, src, size)
+            applyEmboss(c, size)
+            return clip(layers, size)
+        }
+        clearSheen(glyph)
+        softShadow(c, glyph, size, CLEAR_SHADOW)
+        c.drawBitmap(glyph, 0f, 0f, bitmapPaint)
+        glyph.recycle()
+        // Icon contour: the same edge as Default icons (One UI's emboss), not 0.231's white rim (user, 0.242)
+        applyEmboss(c, size)
+        return clip(layers, size)
+    }
+
+    /**
+     * Clear Colour's cut edges: a pixel near a cut-out part ([UNMIX_CUT] or less left) that is a blend of the plate and
+     * the art beside it (on the line between the plate's colour and the strongest solid colour within a few pixels)
+     * becomes that art colour, as see-through as it was near the plate. Unlike unblendEdges it looks a few pixels
+     * round, not one: a white mark on red, scaled down, blends over 2–3 pixels, and the inner ones stayed pale (user,
+     * 0.239: dotted white outlines round YT Music's ring and Skipii's mark). Checked on YT Music's own layers.
+     */
+    private fun unmixEdges(px: IntArray, drawn: IntArray, bg: IntArray, size: Int) {
+        val r = max(2, size / 64)
+        val keyed = px.copyOf()
+        for (y in 0 until size) for (x in 0 until size) {
+            val i = y * size + x
+            val a = Color.alpha(drawn[i])
+            if (a == 0 || Color.alpha(bg[i]) < 128 || Color.alpha(keyed[i]) == 0) continue
+            val p = drawn[i]
+            val b = bg[i]
+            val d = colorDistance(p, b)
+            var cut = false
+            var best = -1
+            var bestD = 0f
+            for (yy in max(0, y - r)..minOf(size - 1, y + r)) for (xx in max(0, x - r)..minOf(size - 1, x + r)) {
+                val j = yy * size + xx
+                if (Color.alpha(keyed[j]) < UNMIX_CUT) { cut = true; continue }
+                if (Color.alpha(drawn[j]) > 200) { val dj = colorDistance(drawn[j], b); if (dj > bestD) { bestD = dj; best = j } }
+            }
+            if (!cut || best < 0 || bestD < d + 0.08f) continue
+            val f = drawn[best]
+            val fr = (Color.red(f) - Color.red(b)).toFloat()
+            val fg = (Color.green(f) - Color.green(b)).toFloat()
+            val fb = (Color.blue(f) - Color.blue(b)).toFloat()
+            val pr = (Color.red(p) - Color.red(b)).toFloat()
+            val pg = (Color.green(p) - Color.green(b)).toFloat()
+            val pb = (Color.blue(p) - Color.blue(b)).toFloat()
+            val len2 = fr * fr + fg * fg + fb * fb
+            if (len2 < 1f) continue
+            val t = ((pr * fr + pg * fg + pb * fb) / len2).coerceIn(0f, 1f)
+            val er = pr - t * fr; val eg = pg - t * fg; val eb = pb - t * fb
+            // well off that line: detail of its own, not a blend
+            if (kotlin.math.sqrt(er * er + eg * eg + eb * eb) / 441.7f > 0.12f) continue
+            px[i] = (f and 0x00FFFFFF) or ((a * t).roundToInt() shl 24)
+        }
+    }
+
+    /** Light from above on a Clear Colour symbol: a white sheen over its top, gone by about 60 % of the way down. Off with Icon contour. */
+    private fun clearSheen(glyph: Bitmap) {
+        if (!iconShine) return
+        val box = opaqueBounds(glyph)
+        if (!box.isEmpty) Canvas(glyph).drawPaint(Paint().apply {
+            shader = android.graphics.LinearGradient(0f, box.top.toFloat(), 0f, box.top + box.height() * 0.6f,
+                CLEAR_SHEEN, 0x00FFFFFF, Shader.TileMode.CLAMP)
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_ATOP)
+        })
+    }
+
+    /**
+     * Icon theme › Minimal Colour ([LOOK_MINIMAL_COLOUR]): Clear Colour's symbol on its own, the app's own colours with
+     * no plate or glass, over Minimal's soft shadow (user, 0.235: "just the inner icon of the frosted coloured icons").
+     * Art with no background to take away shows whole, as in Clear Colour.
+     */
+    fun createMinimalColour(src: Drawable, size: Int, pkg: String?): Bitmap {
+        val glyph = clearGlyph(src, size, pkg) ?: clearArt(src, size) ?: run {
+            val layers = blank(size)
+            ownIcon(Canvas(layers), src, size)
+            return clip(layers, size)
+        }
+        clearSheen(glyph)
+        return minimal(glyph, size)
+    }
+
+    /**
+     * Clear Colour's symbol, on transparent:
+     * - Chrome: its logo, drawn ([drawChromeLogo]).
+     * - An adaptive icon's foreground, with the parts that match its own plate cut out (they were the plate showing
+     *   through: YT Music's ring, WhatsApp's handset), so the glass shows there instead.
+     * - What's left keeps its colours when it has some (Photos, Gmail). A white, grey or black symbol takes its plate's
+     *   colours instead (gradients included, as Instagram's), white parts in the plate's colour and dark parts in a deep
+     *   shade of it (Waze's outline and face). A plate too light to read on glass leaves the symbol as it is.
+     * - null for games, legacy icons and foregrounds that still fill the whole icon once the plate's colour is cut out
+     *   (Skipii's foreground repeats its white plate, so it's cut away and its red mark is left): [clearArt] takes
+     *   those. A small tile of the icon on the glass looked wrong (user, 0.231: Skipii, Monopoly GO).
+     */
+    private fun clearGlyph(src: Drawable, size: Int, pkg: String?): Bitmap? {
+        val s = size.toFloat()
+        val glyph = blank(size)
+        val g = Canvas(glyph)
+        if (pkg in CHROME) {
+            drawChromeLogo(g, s / 2f, s / 2f, s * CLEAR_CHROME_RADIUS)
+            return glyph
+        }
+        val d = src as? AdaptiveIconDrawable
+        val fg = d?.foreground
+        if (d != null && fg != null) {
+            val inset = (size * 0.25f).roundToInt()
+            val bounds = Rect(-inset, -inset, size + inset, size + inset)
+            fg.bounds = bounds
+            fg.draw(g)
+            val px = IntArray(size * size)
+            glyph.getPixels(px, 0, size, 0, 0, size, size)
+            if (isGame(pkg)) {
+                // a game's layers already split its art from its background: the art alone, exactly as drawn, with
+                // no colour matching that could take its shading (user, 0.240: Mr. Monopoly's ear and cheek were
+                // eaten by the red key). Art that fills the icon goes to clearArt
+                if (coverage(px, size) in CLEAR_EMPTY..CLEAR_FULL_ART) return glyph
+                glyph.recycle()
+                return null
+            }
+            val plate = blank(size)
+            d.background?.let { it.bounds = bounds; it.draw(Canvas(plate)) }
+            val bg = IntArray(size * size)
+            plate.getPixels(bg, 0, size, 0, 0, size, size)
+            plate.recycle()
+            // the plate showing through the symbol: cut out, then the antialiased edge pixels unmixed from the plate's
+            // colour ([unmixEdges]), so no pale ring of it is left round the art (user, 0.239: white outlines peeking
+            // round YT Music's and Skipii's red marks). Not keyOutBackground: its speck pass also takes thin lines
+            // between cut areas, and its unblend looks only a pixel round
+            val drawn = px.copyOf()
+            for (i in px.indices) {
+                val a = Color.alpha(px[i])
+                if (a == 0 || Color.alpha(bg[i]) < 128) continue
+                val k = smooth(0.06f, 0.16f, colorDistance(px[i], bg[i]))
+                if (k < 1f) px[i] = (px[i] and 0x00FFFFFF) or ((a * k).roundToInt() shl 24)
+            }
+            unmixEdges(px, drawn, bg, size)
+            // nothing left (the symbol was all plate colour) shows the icon whole too
+            if (coverage(px, size) in CLEAR_EMPTY..CLEAR_FULL_ART) {
+                var weight = 0f
+                var colour = 0f
+                for (p in px) {
+                    val a = (p ushr 24) / 255f
+                    weight += a
+                    if (chroma(p) > CLEAR_COLOURFUL_CHROMA) colour += a
+                }
+                val plateColour = averageColor(bg)
+                val plain = weight > 0f && colour / weight < CLEAR_COLOURFUL_SHARE
+                if (plain && plateColour != null && luminance(plateColour) < CLEAR_FILL_MAX_LUMINANCE) {
+                    for (i in px.indices) {
+                        val p = px[i]
+                        if (p ushr 24 == 0) continue
+                        val b = bg[i].takeIf { it ushr 24 > 0 } ?: plateColour
+                        val k = CLEAR_DEEP + (1f - CLEAR_DEEP) * luminance(p)
+                        px[i] = (p and 0xFF000000.toInt()) or
+                            ((Color.red(b) * k).roundToInt() shl 16) or ((Color.green(b) * k).roundToInt() shl 8) or (Color.blue(b) * k).roundToInt()
+                    }
+                }
+                glyph.setPixels(px, 0, size, 0, 0, size, size)
+                return glyph
+            }
+        }
+        glyph.recycle()
+        return null
+    }
+
+    /**
+     * Clear Colour for an icon that is all art (a game, a legacy icon, a foreground that fills the icon): its own icon
+     * with the background around the art taken away, so the glass shows there and the art sits on it in its own
+     * colours (user, 0.233: "Monopoly can have the red background be frosted"). The background is the colour most of
+     * the icon's outer ring has: a hue for a coloured one, matched by hue so a gradient goes too (Monopoly GO's red
+     * runs from orange-red to deep red) and as strong a colour (his skin is a near hue, but paler); otherwise a colour
+     * (a white tray). Checked on Monopoly GO's Play Store icon with a port of this. Only background joined to the edge goes
+     * (a flood fill inward), so the same colour inside the art stays (Mr. Monopoly's nose and mouth). The art's own
+     * edge is softened by how far each pixel's colour is from the background beside it. Null if too little or too much
+     * comes away.
+     */
+    private fun clearArt(src: Drawable, size: Int): Bitmap? {
+        val n = size * size
+        val work = blank(size)
+        ownIcon(Canvas(work), src, size)
+        val px = IntArray(n)
+        work.getPixels(px, 0, size, 0, 0, size, size)
+        val h = size / 2f
+        val hsl = FloatArray(3)
+        // the outer ring: its hues (coloured pixels only), and all of it for a neutral background
+        val bins = FloatArray(24)
+        val ring = ArrayList<Int>()
+        var coloured = 0
+        for (y in 0 until size) for (x in 0 until size) {
+            val d = kotlin.math.hypot(x - h, y - h) / size
+            if (d < ART_RING_IN || d > ART_RING_OUT) continue
+            val p = px[y * size + x]
+            ring += p
+            if (chroma(p) > ART_CHROMA) {
+                androidx.core.graphics.ColorUtils.colorToHSL(p, hsl)
+                bins[(hsl[0] / 15f).toInt().coerceIn(0, 23)] += 1f
+                coloured++
+            }
+        }
+        if (ring.isEmpty()) { work.recycle(); return null }
+        var keyHue = -1f
+        var keyChroma = 0f
+        var keyColour = 0
+        if (coloured > ring.size * ART_COLOURED_RING) {
+            // the busiest hue, with its neighbours (a hue near a bin's edge splits between two)
+            val top = bins.indices.maxBy { bins[it] + 0.5f * (bins[(it + 23) % 24] + bins[(it + 1) % 24]) }
+            val centre = top * 15f + 7.5f
+            // the background is the ring's strongest colour: only the most saturated [ART_KEY_SHARE] of that hue
+            // family sets its hue and strength. Averaging all of it took in art of a near hue: on the user's phone
+            // Monopoly GO's icon is zoomed in, its ring mostly Mr. Monopoly, so his skin pulled the key off the red
+            // and his ear was keyed out with it (0.241; found on a screenshot of the icon in Default)
+            val family = ArrayList<Pair<Float, Float>>()
+            for (p in ring) {
+                val ch = chroma(p)
+                if (ch <= ART_CHROMA) continue
+                androidx.core.graphics.ColorUtils.colorToHSL(p, hsl)
+                if (hueGap(hsl[0], centre) <= 22.5f) family += hsl[0] to ch
+            }
+            family.sortByDescending { it.second }
+            val strongest = family.subList(0, maxOf(1, (family.size * ART_KEY_SHARE).toInt()).coerceAtMost(family.size))
+            var sx = 0.0; var sy = 0.0; var cs = 0f
+            for ((hue, ch) in strongest) {
+                sx += kotlin.math.cos(Math.toRadians(hue.toDouble())); sy += kotlin.math.sin(Math.toRadians(hue.toDouble())); cs += ch
+            }
+            keyHue = ((Math.toDegrees(kotlin.math.atan2(sy, sx)) + 360.0) % 360.0).toFloat()
+            // how strong the background's colour is: art of a near hue but weaker colour stays (Mr. Monopoly's shaded skin)
+            keyChroma = if (strongest.isNotEmpty()) cs / strongest.size else ART_CHROMA
+        } else keyColour = ringMedian(px, size)
+        // 0 for the background, 1 for art
+        fun art(p: Int): Float = if (keyHue >= 0f) {
+            androidx.core.graphics.ColorUtils.colorToHSL(p, hsl)
+            max(smooth(ART_HUE_NEAR, ART_HUE_FAR, hueGap(hsl[0], keyHue)), 1f - smooth(keyChroma * ART_WEAK, keyChroma * ART_STRONG, chroma(p)))
+        } else smooth(ART_DIST_NEAR, ART_DIST_FAR, colorDistance(p, keyColour))
+        val away = FloatArray(n) { art(px[it]) }
+        val cleared = BooleanArray(n)
+        val queue = ArrayDeque<Int>()
+        for (y in 0 until size) for (x in 0 until size) {
+            val i = y * size + x
+            if (kotlin.math.hypot(x - h, y - h) / size >= ART_RING_IN && away[i] < ART_SEED) { cleared[i] = true; queue.add(i) }
+        }
+        while (queue.isNotEmpty()) {
+            val i = queue.removeFirst()
+            val x = i % size
+            for (j in intArrayOf(if (x > 0) i - 1 else -1, if (x < size - 1) i + 1 else -1, i - size, i + size)) {
+                if (j < 0 || j >= n || cleared[j] || away[j] >= ART_PROP || colorDistance(px[i], px[j]) >= ART_STEP) continue
+                cleared[j] = true; queue.add(j)
+            }
+        }
+        // the art's edge: as see-through as it is close in colour to the background beside it (an antialiased pixel
+        // half background goes half; the art's own colours stay solid)
+        val src = px.copyOf()
+        for (i in 0 until n) {
+            if (cleared[i]) { px[i] = 0; continue }
+            val x = i % size
+            var near = 1f
+            for (j in intArrayOf(if (x > 0) i - 1 else -1, if (x < size - 1) i + 1 else -1, i - size, i + size)) {
+                if (j >= 0 && j < n && cleared[j]) near = minOf(near, colorDistance(src[i], src[j]))
+            }
+            if (near < 1f) px[i] = (src[i] and 0x00FFFFFF) or ((Color.alpha(src[i]) * smooth(0.04f, 0.25f, near)).roundToInt() shl 24)
+        }
+        val cover = coverage(px, size)
+        if (cover < ART_MIN || cover > ART_MAX) { work.recycle(); return null }
+        work.setPixels(px, 0, size, 0, 0, size, size)
+        return work
+    }
+
+    /** How far apart two hues are, 0–180°. */
+    private fun hueGap(a: Float, b: Float): Float = kotlin.math.abs(((a - b) % 360f + 540f) % 360f - 180f)
 
     /** How far [shape]'s outline reaches from the icon's centre at its farthest, as a share of the icon (a hair over). */
     private fun reach(shape: String): Float = reaches.getOrPut(shape) {

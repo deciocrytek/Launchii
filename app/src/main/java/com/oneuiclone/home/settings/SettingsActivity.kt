@@ -134,6 +134,19 @@ class SettingsActivity : OneUiPage() {
                 if (it) { downNotif.isChecked = false; upSearch.isChecked = false }
             }.switch()
             toggle("Web suggestions in search", "Show Google suggestions as you type. What you type is sent to Google.", prefs.webSuggestions) { prefs.webSuggestions = it }
+            // the search bar's learned keyboard spot (0.230): shown, and re-learned on request
+            val spot = com.oneuiclone.home.ui.KeyboardSpot(this@SettingsActivity)
+            val kb = spot.describe()
+            item("Search keyboard height", kb?.let { (name, dp, seen) -> "Learned from $name · $dp dp · seen $seen ${if (seen == 1) "time" else "times"}" }
+                ?: "Learned the next time you open search") {
+                if (kb == null) return@item
+                AlertDialog.Builder(this@SettingsActivity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                    .setTitle("Re-learn keyboard height?")
+                    .setMessage("Search forgets where your keyboard sits and learns it again the next time you open it.")
+                    .setPositiveButton("Re-learn") { _, _ -> spot.relearn(); build() }
+                    .setNegativeButton(android.R.string.cancel, null)
+                    .show()
+            }
             upSearch = toggle("Swipe up for search", "Open search instead of the Apps screen by swiping up on the Home screen.",
                 prefs.swipeUpSearch && !prefs.swipeDownSearch) {
                 prefs.swipeUpSearch = it

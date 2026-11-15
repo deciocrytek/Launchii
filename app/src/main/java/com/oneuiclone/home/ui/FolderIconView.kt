@@ -156,23 +156,49 @@ open class FolderIconView(context: Context, dp: DeviceProfile) : IconView(contex
 
     /**
      * The squircle container (rim, glass, colour) on a canvas already moved to the icon's [left], [top], grown by
-     * [folderBgScale] while an app hovers over the folder.
+     * [folderBgScale] while an app hovers over the folder. It takes in the parts of the apps that poke out past it
+     * ([outline]), so the see-through themes (Frosted, Clear Colour), whose previews are their symbols alone
+     * (AppInfo.previewIcon), show the folder's own glass and colour there, all one shape, rather than the wallpaper
+     * sharp through them (user, 0.235/0.238; 0.234's own glass under each app looked worse).
      */
     protected fun drawContainer(canvas: Canvas, left: Int, top: Int) {
-        canvas.save()
-        canvas.scale(folderBgScale * plateScale, folderBgScale * plateScale, iconSize / 2f, iconSize / 2f)
-        rimPaint.alpha = (0x24 * containerAlpha).toInt()
-        canvas.drawPath(shape, rimPaint)
+        val path = outline(folderBgScale * plateScale)
+        // no contour: 0.246 gave folders the icons' emboss with Icon contour on; the user wanted none (0.247)
         drawnAt.reset(); transformMatrixToGlobal(drawnAt)
         val at = glassFixed
         if (at != null) glassAt.set(at) else { glassAt.set(drawnAt); glassAt.preTranslate(left.toFloat(), top.toFloat()) }
         if (glassPaint.aim(glass, glassAt)) {
             glassPaint.paint.alpha = (255 * containerAlpha).toInt()
-            canvas.drawPath(shape, glassPaint.paint)
+            canvas.drawPath(path, glassPaint.paint)
         }
         fillPaint.alpha = (android.graphics.Color.alpha(bgColor) * containerAlpha * fillOpacity).toInt()
-        canvas.drawPath(shape, fillPaint)
-        canvas.restore()
+        canvas.drawPath(path, fillPaint)
+    }
+
+    private val outlinePath = Path()
+    private var outlineKey: List<Any>? = null
+    private val outlineRect = RectF()
+
+    /**
+     * The container's outline at [scale] about its centre, in icon coordinates: its shape, joined with each preview
+     * app's shape where it shows, so the parts poking out are the folder too. Cached until something moves.
+     */
+    private fun outline(scale: Float): Path {
+        // every layout: Pixel's four poke past the plate a little too (0.235 joined them only for Outside)
+        val n = if (previewAlpha > 0f) minOf(previewSlots, previews.size) else 0
+        val key = listOf(iconSize, scale, n, layout, IconShape.current, IconShape.container, hiddenPreviews)
+        if (key == outlineKey) return outlinePath
+        outlineKey = key
+        outlinePath.reset()
+        shape.transform(Matrix().apply { setScale(scale, scale, iconSize / 2f, iconSize / 2f) }, outlinePath)
+        for (i in 0 until n) {
+            if (i in hiddenPreviews) continue
+            childRect(i, outlineRect)
+            val app = IconShape.path(outlineRect.width())
+            app.offset(outlineRect.left, outlineRect.top)
+            outlinePath.op(app, Path.Op.UNION)
+        }
+        return outlinePath
     }
 
     /** Position of preview child [rank] relative to icon top-left. */
@@ -249,10 +275,15 @@ open class FolderIconView(context: Context, dp: DeviceProfile) : IconView(contex
                 if (i in hiddenPreviews) continue
                 val b = previews.getOrNull(rankInSlot(i)) ?: continue
                 childRect(i, dst)
-                shaped.draw(canvas, b, dst, bmpPaint)
+                drawPreview(canvas, b, dst, left, top)
             }
         }
         canvas.restore()
+    }
+
+    /** Preview app [b] in [rect], on a canvas moved to the icon's [left], [top]. */
+    protected fun drawPreview(canvas: Canvas, b: Bitmap, rect: RectF, @Suppress("UNUSED_PARAMETER") left: Int, @Suppress("UNUSED_PARAMETER") top: Int) {
+        shaped.draw(canvas, b, rect, bmpPaint)
     }
 
     fun iconRectOnScreen(out: Rect) = iconBoundsOnScreen(out)

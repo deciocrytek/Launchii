@@ -332,4 +332,15 @@ open class IconView(context: Context, protected val dp: DeviceProfile) : View(co
         canvas.drawPath(platePath!!, plateGlassPaint.paint)
         canvas.restore()
     }
+
+    companion object {
+        /**
+         * How far above its cell's centre a labelled Home icon's centre sits: half its label and gap, as
+         * [iconTop] centres the icon+gap+label block. A widget set to Align with icons rises by this much.
+         */
+        fun labelLift(context: Context, dp: DeviceProfile): Float {
+            val fm = TextPaint().apply { textSize = dp.labelTextSizePx; typeface = Fonts.ui(context, 400) }.fontMetrics
+            return ((fm.descent - fm.ascent) + dp.iconLabelGapPx) / 2f
+        }
+    }
 }

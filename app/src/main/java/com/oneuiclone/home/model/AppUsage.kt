@@ -30,6 +30,9 @@ class AppUsage(private val context: Context) {
         prefs.edit().putString(k, "${decayed(prefs.getString(k, null), now) + 1.0}|$now").apply()
     }
 
+    /** When [key] was last opened through the launcher (ms), or 0. */
+    fun lastLaunched(key: AppKey): Long = prefs.getString(key.flatten(), null)?.substringAfter('|', "")?.toLongOrNull() ?: 0L
+
     /** Score per app; higher = opened more. Reads the system's usage events, so call it off the main thread. */
     fun scores(apps: List<AppInfo>): Map<AppKey, Double> {
         val now = System.currentTimeMillis()

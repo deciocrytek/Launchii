@@ -67,7 +67,7 @@ class StylePreview(private val activity: Activity) {
                 iconScale = iconScale,
                 themed = prefs.themedIcons,
                 themeAll = prefs.themeAllApps,
-                plateAlpha = if (prefs.themedIcons && prefs.glassIcons) 1f - transparency / 100f else 1f,
+                plateAlpha = if (prefs.seeThroughPlates) 1f - transparency / 100f else 1f,
                 labels = prefs.homeLabels,
                 dark = prefs.darkIcons,
                 minimal = prefs.minimalIcons,
@@ -490,8 +490,8 @@ class StylePreview(private val activity: Activity) {
         }
     }
 
-    /** Looks whose plates show the blurred wallpaper through them (Frosted, Stencil), as Home draws them. */
-    private fun needsGlass(look: Look) = look.themed && (look.plateAlpha < 1f || look.look == IconFactory.LOOK_STENCIL)
+    /** Looks whose plates show the blurred wallpaper through them (Frosted, Stencil, Clear Colour), as Home draws them. */
+    private fun needsGlass(look: Look) = look.themed && (look.plateAlpha < 1f || look.look in IconFactory.GLASS_LOOKS)
 
     /** The lock screen: its wallpaper under a large stacked clock and the date. */
     fun renderLock(outWidth: Int): Bitmap? {

@@ -37,7 +37,7 @@ object WidgetStyles {
 
     /** Forgets everything stored for a removed widget. */
     fun clear(context: Context, appWidgetId: Int) {
-        prefs(context).edit().remove(key(appWidgetId)).remove(themeKey(appWidgetId)).apply()
+        prefs(context).edit().remove(key(appWidgetId)).remove(themeKey(appWidgetId)).remove(alignKey(appWidgetId)).apply()
     }
 
     /** Same as [transparency], for the folder with model id [folderId]. */
@@ -60,7 +60,18 @@ object WidgetStyles {
         prefs(context).edit().putInt(themeKey(appWidgetId), theme).apply()
     }
 
+    /**
+     * Whether the widget sits on the icons' centre line (long-press › Align with icons) instead of centred in its
+     * rows (the default): with Home labels on, the icons sit above their cells' centres by [IconView.labelLift].
+     */
+    fun iconAligned(context: Context, appWidgetId: Int): Boolean = prefs(context).getBoolean(alignKey(appWidgetId), false)
+
+    fun setIconAligned(context: Context, appWidgetId: Int, aligned: Boolean) {
+        prefs(context).edit().putBoolean(alignKey(appWidgetId), aligned).apply()
+    }
+
     private fun key(appWidgetId: Int) = "t_$appWidgetId"
+    private fun alignKey(appWidgetId: Int) = "a_$appWidgetId"
     private fun themeKey(appWidgetId: Int) = "m_$appWidgetId"
     private fun folderKey(folderId: Long) = "f_$folderId"
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)

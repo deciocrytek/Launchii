@@ -24,8 +24,10 @@ class IconThemeActivity : OneUiPage() {
         // 8 Satin: the themed glyph in white, faintly shaded, on a matte black plate.
         // 9–12 Doodle, Sprinkles, Comic, Groovy: the playful looks (IconFactory.LOOK_*).
         // 13 Glass: each app's own icon with a subtle glass finish, light or dark.
+        // 14 Clear Colour: each app's symbol in its own colours on clear frosted glass.
+        // 15 Minimal Colour: Clear Colour's symbol alone, no plate.
         val STYLES = listOf("Default", "Themed", "Frosted", "Dark", "Minimal", "Dot", "Prism", "Stencil", "Satin",
-            "Doodle", "Sprinkles", "Comic", "Groovy", "Glass")
+            "Doodle", "Sprinkles", "Comic", "Groovy", "Glass", "Clear Colour", "Minimal Colour")
         val SUMMARIES = listOf(
             "Each app's own icon",
             "Your colour palette, or a colour you pick, on app icons",
@@ -41,17 +43,21 @@ class IconThemeActivity : OneUiPage() {
             "Pop-art halftone with bold black ink",
             "70s outlines in warm stripes",
             "Each app's own icon with a subtle glass effect. Dark plates in dark mode",
+            "Each app's colours on clear frosted glass over your wallpaper",
+            "Just the symbols in each app's own colours, with no shape behind them",
         )
         /** The Icon theme page's groups, in order, and the styles in each. */
-        val GROUPS = listOf("Simple" to listOf(0, 1, 2, 3, 4, 13), "Stylish" to (5..8).toList(), "Playful" to (9..12).toList())
-        private val THEMED = setOf(1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)
+        val GROUPS = listOf("Simple" to listOf(0, 1, 2, 14, 3, 4, 15, 13), "Stylish" to (5..8).toList(), "Playful" to (9..12).toList())
+        private val THEMED = setOf(1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
         /** The styles with a light and a dark version (Dot, Prism, the playful ones and Glass), which get Light or dark. */
         private val LIGHT_AND_DARK = setOf(5, 6, 9, 10, 11, 12, 13)
         private const val COMIC = 11
-        /** The styles drawn in the theme colour (Themed and Frosted), which get Icon colour. */
-        private val COLOURED = setOf(1, 2)
-        /** The styles whose plate has a contour (One UI's emboss, Satin's or Glass's rim), which get Icon contour. */
-        private val CONTOURED = setOf(0, 1, 2, 3, 5, 6, 7, 8, 10, 12, 13)
+        /** The styles drawn in the theme colour (Themed, Frosted and Clear Colour's veil), which get Icon colour. */
+        private val COLOURED = setOf(1, 2, 14)
+        /** The see-through styles (Frosted's plate, Clear Colour's veil), which get Icon transparency. */
+        private val SEE_THROUGH = setOf(2, 14)
+        /** The styles whose plate has a contour (One UI's emboss, Satin's, Glass's or Clear Colour's rim), which get Icon contour. */
+        private val CONTOURED = setOf(0, 1, 2, 3, 5, 6, 7, 8, 10, 12, 13, 14, 15)
         /** Each look's style index. */
         private val LOOKS = mapOf(
             5 to com.oneuiclone.home.icons.IconFactory.LOOK_DOT,
@@ -63,6 +69,8 @@ class IconThemeActivity : OneUiPage() {
             11 to com.oneuiclone.home.icons.IconFactory.LOOK_COMIC,
             12 to com.oneuiclone.home.icons.IconFactory.LOOK_GROOVY,
             13 to com.oneuiclone.home.icons.IconFactory.LOOK_IOS,
+            14 to com.oneuiclone.home.icons.IconFactory.LOOK_CLEAR_COLOUR,
+            15 to com.oneuiclone.home.icons.IconFactory.LOOK_MINIMAL_COLOUR,
         )
 
         /** Saves style [s] (Default, Themed, …, Glass). The icon shape stays as it is (the user's choice, 0.209). */
@@ -77,7 +85,7 @@ class IconThemeActivity : OneUiPage() {
         /** [base] (the saved look) with style [s] in its place, for previews of the styles not chosen. */
         fun look(s: Int, base: StylePreview.Look, prefs: Prefs) = base.copy(
             themed = s in THEMED, dark = s == 3, minimal = s == 4, look = LOOKS[s] ?: "",
-            plateAlpha = if (s == 2) 1f - prefs.glassIconTransparency / 100f else 1f,
+            plateAlpha = if (s in SEE_THROUGH) 1f - prefs.glassIconTransparency / 100f else 1f,
         )
         private val MODES = listOf(
             com.oneuiclone.home.icons.IconFactory.MODE_AUTO to "Auto",
@@ -307,7 +315,7 @@ class IconThemeActivity : OneUiPage() {
                 colourRows(s in COLOURED)
                 modeRows.forEach { it.visibility = if (s in LIGHT_AND_DARK) View.VISIBLE else View.GONE }
                 anyRows.forEach { it.visibility = if (s > 0) View.VISIBLE else View.GONE }
-                frostedRows.forEach { it.visibility = if (s == 2) View.VISIBLE else View.GONE }
+                frostedRows.forEach { it.visibility = if (s in SEE_THROUGH) View.VISIBLE else View.GONE }
                 comicRows.forEach { it.visibility = if (s == COMIC) View.VISIBLE else View.GONE }
                 contourRows.forEach { it.visibility = if (s in CONTOURED) View.VISIBLE else View.GONE }
             }

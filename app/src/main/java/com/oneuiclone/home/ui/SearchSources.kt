@@ -36,12 +36,30 @@ class SearchSources(
 
     class Snapshot(val scores: Map<AppKey, Double>, val contacts: List<Contact>)
 
+    /**
+     * What search learned from the apps opened in it (0.230, as Pixel's search does), taken as a search opens so
+     * nothing moves while it's up: per typed query, the app opened after it most ([top]), and how much each app is
+     * opened from search at all ([use]). Both fade with a [PICK_HALF_LIFE_DAYS] half-life.
+     */
+    class Picks(private val top: Map<String, AppKey>, private val use: Map<AppKey, Double>, private val recent: Set<AppKey>) {
+        /** The app picked most after typing [q] (normalised), once it has [PICK_MIN]. */
+        fun top(q: String): AppKey? = top[q]
+        /** Search opens of [k], faded (whole opens only, so one old open doesn't count). */
+        fun use(k: AppKey): Int = (use[k] ?: 0.0).toInt()
+        /** Opened (from anywhere) in the last few minutes. */
+        fun recent(k: AppKey) = k in recent
+    }
+
     private val launcherApps = context.getSystemService(LauncherApps::class.java)
     private val main = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "search-sources").apply { priority = Thread.NORM_PRIORITY - 1 } }
     private val opened = context.getSharedPreferences("search_contacts", Context.MODE_PRIVATE)
     private val saved = context.getSharedPreferences("search_suggestions", Context.MODE_PRIVATE)
     private var refreshing = false
+    private val pickPrefs = context.getSharedPreferences("search_picks", Context.MODE_PRIVATE)
+    /** query → app → (score, when); app → (score, when). Main thread, after [init] loads them. */
+    private var byQuery = HashMap<String, HashMap<String, DoubleArray>>()
+    private var searchUse = HashMap<String, DoubleArray>()
 
     /** What a search opening now shows. Main thread. */
     var snapshot = Snapshot(emptyMap(), emptyList()); private set
@@ -51,8 +69,81 @@ class SearchSources(
     init {
         worker.execute {
             val s = restore()
-            main.post { if (snapshot.scores.isEmpty() && snapshot.contacts.isEmpty()) snapshot = s }
+            val q = loadPicks()
+            main.post {
+                if (snapshot.scores.isEmpty() && snapshot.contacts.isEmpty()) snapshot = s
+                if (byQuery.isEmpty() && searchUse.isEmpty()) { byQuery = q.first; searchUse = q.second }
+            }
         }
+    }
+
+    /** What a search opening now learned from earlier ones. Main thread. */
+    fun picks(): Picks {
+        val now = System.currentTimeMillis()
+        val top = HashMap<String, AppKey>()
+        for ((q, apps) in byQuery) {
+            val best = apps.maxByOrNull { decayed(it.value, now) } ?: continue
+            if (decayed(best.value, now) >= PICK_MIN) AppKey.parse(best.key)?.let { top[q] = it }
+        }
+        val use = HashMap<AppKey, Double>()
+        for ((k, v) in searchUse) AppKey.parse(k)?.let { use[it] = decayed(v, now) }
+        val recent = apps().mapNotNullTo(HashSet()) { a -> a.key.takeIf { now - usage.lastLaunched(it) < RECENT_MS } }
+        return Picks(top, use, recent)
+    }
+
+    /**
+     * [key] was opened from search after typing [query] (normalised; empty: from the suggestions). The query counts
+     * fully, the shorter ones typed on the way to it half ("spo" → Spotify also teaches "s" and "sp", a little).
+     */
+    fun picked(query: String, key: AppKey) {
+        val now = System.currentTimeMillis()
+        val k = key.flatten()
+        fun add(map: HashMap<String, DoubleArray>, id: String, w: Double) {
+            val old = map[id]
+            map[id] = doubleArrayOf((old?.let { decayed(it, now) } ?: 0.0) + w, now.toDouble())
+        }
+        add(searchUse, k, 1.0)
+        val q = query.take(MAX_PICK_QUERY)
+        for (n in 1..q.length) {
+            val prefix = q.substring(0, n).trimEnd()
+            if (prefix.isEmpty()) continue
+            add(byQuery.getOrPut(prefix) { HashMap() }, k, if (n == q.length) 1.0 else 0.5)
+        }
+        prunePicks(now)
+        savePicks()
+    }
+
+    private fun decayed(v: DoubleArray, now: Long) =
+        v[0] * Math.pow(0.5, (now - v[1]).coerceAtLeast(0.0) / (PICK_HALF_LIFE_DAYS * 86_400_000.0))
+
+    /** At most [MAX_PICK_QUERIES] queries (the faintest go) and [MAX_PICKS_PER_QUERY] apps each. */
+    private fun prunePicks(now: Long) {
+        for (apps in byQuery.values) if (apps.size > MAX_PICKS_PER_QUERY) {
+            apps.entries.sortedBy { decayed(it.value, now) }.take(apps.size - MAX_PICKS_PER_QUERY).forEach { apps.remove(it.key) }
+        }
+        if (byQuery.size > MAX_PICK_QUERIES) {
+            byQuery.entries.sortedBy { e -> e.value.values.maxOfOrNull { decayed(it, now) } ?: 0.0 }
+                .take(byQuery.size - MAX_PICK_QUERIES).map { it.key }.forEach { byQuery.remove(it) }
+        }
+    }
+
+    private fun savePicks() {
+        fun enc(m: Map<String, DoubleArray>) = JSONObject().apply { for ((k, v) in m) put(k, JSONArray().put(v[0]).put(v[1])) }
+        val q = JSONObject()
+        for ((query, apps) in byQuery) q.put(query, enc(apps))
+        pickPrefs.edit().putString(KEY_PICKS, q.toString()).putString(KEY_USE, enc(searchUse).toString()).apply()
+    }
+
+    private fun loadPicks(): Pair<HashMap<String, HashMap<String, DoubleArray>>, HashMap<String, DoubleArray>> = try {
+        fun dec(o: JSONObject) = HashMap<String, DoubleArray>().apply {
+            for (k in o.keys()) o.optJSONArray(k)?.let { put(k, doubleArrayOf(it.getDouble(0), it.getDouble(1))) }
+        }
+        val q = HashMap<String, HashMap<String, DoubleArray>>()
+        pickPrefs.getString(KEY_PICKS, null)?.let { JSONObject(it) }?.let { o -> for (k in o.keys()) o.optJSONObject(k)?.let { q[k] = dec(it) } }
+        val use = pickPrefs.getString(KEY_USE, null)?.let { dec(JSONObject(it)) } ?: HashMap()
+        q to use
+    } catch (_: Exception) {
+        HashMap<String, HashMap<String, DoubleArray>>() to HashMap()
     }
 
     /**
@@ -182,5 +273,18 @@ class SearchSources(
         private const val KEY_SCORES = "scores"
         private const val KEY_CONTACTS = "contacts"
         private const val KEY_AT = "at"
+        private const val KEY_PICKS = "picks"
+        private const val KEY_USE = "use"
+        /**
+         * A query's top pick moves to the front once it has this much: one open right after typing exactly that query
+         * (it holds for about two days, then needs another), or two opens on the way to longer ones (prefixes count half).
+         */
+        private const val PICK_MIN = 0.9
+        private const val PICK_HALF_LIFE_DAYS = 14.0
+        private const val MAX_PICK_QUERY = 16
+        private const val MAX_PICK_QUERIES = 400
+        private const val MAX_PICKS_PER_QUERY = 5
+        /** "Just used": opened this recently gets a small lift in typed results. */
+        private const val RECENT_MS = 10 * 60 * 1000L
     }
 }

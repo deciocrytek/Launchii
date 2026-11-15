@@ -24,6 +24,19 @@ class WidgetContainer(context: Context, val item: HomeItem.Widget, child: View, 
     private var fired = false
     private val lp = Runnable { fired = true; parent?.requestDisallowInterceptTouchEvent(true); performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS); onLongPress?.invoke(this) }
 
+    /**
+     * How far the widget sits above its cells' centre (px): 0 centred in its rows, or [IconView.labelLift] to line
+     * up with the labelled icons beside it. Moves it inside its cells (at layout, as the padding can't go below 0),
+     * so drags, ripples and its own translation are untouched.
+     */
+    var lift = 0
+        set(v) { if (field != v) { field = v; requestLayout() } }
+
+    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+        super.onLayout(changed, left, top, right, bottom)
+        if (lift != 0) for (i in 0 until childCount) getChildAt(i).offsetTopAndBottom(-lift)
+    }
+
     init {
         setPadding(pad, pad, pad, pad)
         clipToPadding = false

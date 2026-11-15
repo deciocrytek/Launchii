@@ -67,7 +67,7 @@ class LargeFolderIconView(context: Context, dp: DeviceProfile) : FolderIconView(
         val c = Canvas(b)
         c.translate(-slot.left, -slot.top)
         bmpPaint.alpha = 255
-        drawSlot(c, i)
+        drawSlot(c, i, iconLeft(), iconTop())
         return b
     }
 
@@ -79,15 +79,15 @@ class LargeFolderIconView(context: Context, dp: DeviceProfile) : FolderIconView(
         if (previewAlpha > 0f) {
             bmpPaint.alpha = (255 * previewAlpha).toInt()
             val slots = if (hasStack) 4 else minOf(4, previews.size)
-            for (i in 0 until slots) if (i != hiddenSlot && i !in hiddenPreviews) drawSlot(canvas, i)
+            for (i in 0 until slots) if (i != hiddenSlot && i !in hiddenPreviews) drawSlot(canvas, i, left, top)
         }
         canvas.restore()
     }
 
     /** An app, or for slot 3 with more than four apps the 8.5 stacked preview: up to three layered mini icons. */
-    private fun drawSlot(canvas: Canvas, i: Int) {
+    private fun drawSlot(canvas: Canvas, i: Int, left: Int, top: Int) {
         childRect(i, slot)
-        if (i < 3 || !hasStack) { shaped.draw(canvas, previews[i], slot, bmpPaint); return }
+        if (i < 3 || !hasStack) { drawPreview(canvas, previews[i], slot, left, top); return }
         val rest = previews.drop(3).take(3)
         val m = slot.width() * 0.62f
         val step = (slot.width() - m) / 2f

@@ -89,9 +89,18 @@ class Prefs(context: Context) {
     var glassIcons: Boolean get() = sp.getBoolean("glass_icons", false); set(v) = sp.edit().putBoolean("glass_icons", v).apply()
     var glassIconTransparency: Int get() = sp.getInt("glass_icon_transparency", 50); set(v) = sp.edit().putInt("glass_icon_transparency", v).apply()
     /** Opacity of a themed icon's plate: below 1 only with glass icons on (and theme icons, which they build on). */
-    val iconPlateAlpha: Float get() = if (themedIcons && glassIcons) 1f - glassIconTransparency / 100f else 1f
-    /** Icons show the blurred wallpaper under them: glass icons' see-through plate, or Stencil's cut-out symbol. */
-    val iconGlass: Boolean get() = iconPlateAlpha < 1f || (themedIcons && iconLook == com.oneuiclone.home.icons.IconFactory.LOOK_STENCIL)
+    val iconPlateAlpha: Float get() = if (seeThroughPlates) 1f - glassIconTransparency / 100f else 1f
+    /**
+     * How opaque the see-through themes' plates look on the whole: Frosted's plate, or Clear Colour's veil on average
+     * (it lightens toward the foot). Folders and Launchii's Bubble and Split widgets take the Icon colour at this, to
+     * match the icons (0.246, 0.248).
+     */
+    val iconTintAlpha: Float get() = iconPlateAlpha *
+        (if (iconLook == com.oneuiclone.home.icons.IconFactory.LOOK_CLEAR_COLOUR) (1f + com.oneuiclone.home.icons.IconFactory.CLEAR_VEIL_FOOT) / 2f else 1f)
+    /** Icon transparency applies: Frosted's plate, or Clear Colour's veil. */
+    val seeThroughPlates: Boolean get() = themedIcons && (glassIcons || iconLook == com.oneuiclone.home.icons.IconFactory.LOOK_CLEAR_COLOUR)
+    /** Icons show the blurred wallpaper under them: glass icons' see-through plate, Stencil's cut-out symbol, or Clear Colour's glass. */
+    val iconGlass: Boolean get() = iconPlateAlpha < 1f || (themedIcons && iconLook in com.oneuiclone.home.icons.IconFactory.GLASS_LOOKS)
     /** Good Lock Home Up "pop-up folder" style. */
     var popupFolders: Boolean get() = sp.getBoolean("popup_folders", false)
         set(v) { sp.edit().putBoolean("popup_folders", v).apply(); com.oneuiclone.home.ui.FolderIconView.popupFolders = v }

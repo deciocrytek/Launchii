@@ -10,7 +10,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 
 /**
- * Icons › Icon colour (Themed and Frosted): its own page, so the picker isn't a long scroll under the other rows.
+ * Icons › Icon colour (Themed, Frosted and Clear Colour): its own page, so the picker isn't a long scroll under the other rows.
  * The dock strip stays fixed at the top; under it, Colour palette (your phone's palette colour, the default), twelve
  * ready-made colours, and a saturation / brightness square over a hue bar for any other.
  *

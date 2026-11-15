@@ -3,9 +3,12 @@ package com.oneuiclone.home.ui
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.animation.ArgbEvaluator
+import android.animation.TimeInterpolator
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.app.SearchManager
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -13,11 +16,13 @@ import android.graphics.Insets
 import android.graphics.RectF
 import android.graphics.RenderEffect
 import android.graphics.Shader
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.CancellationSignal
 import android.os.Handler
 import android.os.Looper
+import android.os.Build
 import android.os.SystemClock
 import android.text.Editable
 import android.text.TextWatcher
@@ -38,8 +43,10 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import com.oneuiclone.home.device.DeviceProfile
 import com.oneuiclone.home.model.AppInfo
 import com.oneuiclone.home.model.AppKey
@@ -47,7 +54,6 @@ import com.oneuiclone.home.motion.Easing
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
-import java.text.Normalizer
 import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.math.abs
@@ -134,10 +140,16 @@ class AppsSearch(
     private val results = CellLayout(context, 4, 2)
     private val contactsBox = LinearLayout(context)
     private val web = LinearLayout(context)
+    /** The answers row (0.230): a sum, a settings page or the Play Store, between the apps and Google. */
+    private val answerBox = LinearLayout(context)
     private val content = LinearLayout(context)
     /** The snapshot this search opened with. */
     private var scores: Map<AppKey, Double> = emptyMap()
     private var suggested: List<SearchSources.Contact> = emptyList()
+    /** What earlier searches learned (taken as the search opens): picks per query, search use, just-used apps. */
+    private var picks = SearchSources.Picks(emptyMap(), emptyMap(), emptySet())
+    private var answer: Answer? = null
+    private var shownAnswer: String? = null
     /** What there is to show; [render] fits it above the bar. */
     private var appsList: List<AppInfo> = emptyList()
     private var contactsList: List<SearchSources.Contact> = emptyList()
@@ -341,8 +353,19 @@ class AppsSearch(
     private val openTextStart = dp.dp(16f + 24f + 6f)
     private val openTextSize = 15f * resources.displayMetrics.scaledDensity     // search_bar_text_size
     private val argb = ArgbEvaluator()
-    private val keyboardPrefs = context.getSharedPreferences("keyboard", Context.MODE_PRIVATE)
-    private val keyboardKey = "ime_height_${dp.widthPx}x${dp.heightPx}"
+    /** The keyboard's learned, locked height (0.230); [legacyKeyboardKey] is where 0.229 and earlier kept the last one seen. */
+    private val keyboardSpot = KeyboardSpot(context)
+    private val legacyKeyboardKey = "ime_height_${dp.widthPx}x${dp.heightPx}"
+    /**
+     * Opening by tap (not Lift-Off): the bar rises with the keyboard, on its timing and curve, rather than on its own
+     * clock (0.230). [rise] is how far up it is; until the keyboard starts (or [RISE_WAIT_MS] passes without one) it
+     * changes shape where it is, so it never floats over empty space while a late keyboard is still coming.
+     */
+    private var riseDriven = false
+    private var riseStarted = false
+    private var rise = 0f
+    private var riseAnim: ValueAnimator? = null
+    private val riseFallback = Runnable { if (isOpen) startRise(Easing.IME_DURATION, Easing.IME) }
 
     private val main = Handler(Looper.getMainLooper())
     private val net = Executors.newSingleThreadExecutor { r -> Thread(r, "web-suggest") }
@@ -363,7 +386,9 @@ class AppsSearch(
                 // showing: ease onto the exact height on the keyboard's own timing; hiding: ride it down
                 if (end > 0) {
                     keyboardComing = true
-                    retargetKeyboard(end.toFloat(), animation.durationMillis.takeIf { it > 0 } ?: Easing.IME_DURATION)
+                    val ms = animation.durationMillis.takeIf { it > 0 } ?: Easing.IME_DURATION
+                    retargetKeyboard(end.toFloat(), ms)
+                    startRise(ms, animation.interpolator)
                 } else retargetKeyboard(0f, 0L)
             }
             return bounds
@@ -382,6 +407,7 @@ class AppsSearch(
             imeAnimating = false
             ime = rootWindowInsets?.getInsets(WindowInsets.Type.ime())?.bottom ?: 0
             layoutPill()
+            checkSettled()
         }
     }
 
@@ -413,7 +439,7 @@ class AppsSearch(
         content.orientation = LinearLayout.VERTICAL
         content.gravity = Gravity.BOTTOM
         content.clipChildren = false
-        for (box in listOf(contactsBox, web)) {
+        for (box in listOf(contactsBox, web, answerBox)) {
             box.orientation = LinearLayout.VERTICAL
             box.clipChildren = false
             content.addView(box, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -444,6 +470,7 @@ class AppsSearch(
                 ime = insets.getInsets(WindowInsets.Type.ime()).bottom
                 if (isOpen && ime > 0) retargetKeyboard(ime.toFloat())
                 layoutPill()
+                checkSettled()
             }
             insets
         }
@@ -451,12 +478,18 @@ class AppsSearch(
         setOnClickListener { if (isOpen) onDismiss() }
     }
 
-    private fun normalize(s: String) = Normalizer.normalize(s.lowercase(), Normalizer.Form.NFD).replace(MARKS, "")
+    private fun normalize(s: String) = SearchMatch.normalize(s)
 
-    /** Labels normalised once per search session (was: every label, twice, per keystroke). */
-    private val index: List<Triple<AppInfo, String, String>> by lazy {
-        apps().map { a -> val l = normalize(a.label); Triple(a, l, initials(l)) }
-    }
+    /**
+     * Labels broken down once per search session (words, initials, other names), not per keystroke. An empty list
+     * isn't kept: a search opened just after the launcher started, before the apps loaded, found no apps at all.
+     */
+    private var indexCache: List<SearchMatch.Entry<AppInfo>> = emptyList()
+    private val index: List<SearchMatch.Entry<AppInfo>>
+        get() {
+            if (indexCache.isEmpty()) indexCache = apps().map { a -> SearchMatch.Entry(a, a.label, a.key.component.packageName) }
+            return indexCache
+        }
 
     private fun filter(q: String) {
         if (!isOpen) return                       // closing: the query is cleared into the hint, results stay put
@@ -467,12 +500,14 @@ class AppsSearch(
             appsList = mostUsed()
             contactsList = suggested
             webList = emptyList()
+            answer = null
             render()
             return
         }
         appsList = matches(query)
         // until the new answers land: the typed query, and whatever of the last ones still fits it
         val raw = q.trim()
+        answer = findAnswer(raw, query, appsList)
         webList = listOf(raw) + webList.drop(1).filter { it.startsWith(raw, ignoreCase = true) && !it.equals(raw, ignoreCase = true) }
         contactsList = contactsList.filter { c -> normalize(c.name).split(' ', '-', '.').any { it.startsWith(query) } }.take(SearchSources.MAX_MATCHES)
         render()
@@ -483,20 +518,26 @@ class AppsSearch(
     /** The [MAX_APPS] most used apps that aren't on Home page 1 (topped up from the rest when there's little history). */
     private fun mostUsed(): List<AppInfo> {
         val skip = firstPage()
-        return index.map { it.first }.filter { it.key !in skip }
+        return index.map { it.item }.filter { it.key !in skip }
             .sortedByDescending { scores[it.key] ?: 0.0 }.take(MAX_APPS)
     }
 
-    /** Name starts with the query, then a word in it does ("e" → Uber Eats) or its initials, then anywhere; more used first. */
-    private fun matches(query: String): List<AppInfo> = index.mapNotNull { (a, l, ini) ->
-        val tier = when {
-            l.startsWith(query) -> 0
-            l.split(' ', '-', '.').any { it.startsWith(query) } || ini.startsWith(query) -> 1
-            l.contains(query) -> 2
-            else -> return@mapNotNull null
-        }
-        Triple(a, tier, scores[a.key] ?: 0.0)
-    }.sortedWith(compareBy<Triple<AppInfo, Int, Double>> { it.second }.thenByDescending { it.third }).take(MAX_APPS).map { it.first }
+    /**
+     * Apps for [query] ([SearchMatch.tier]: name start, word or initials, other name, anywhere, one typo). The app
+     * picked most after typing exactly this goes first (it gets the "go" highlight); then by how well it matches, how
+     * often it's opened from search, whether it was just used, and how often it's opened at all (0.230; up to 0.229:
+     * match, then overall use only).
+     */
+    private fun matches(query: String): List<AppInfo> {
+        val top = picks.top(query)
+        return index.mapNotNull { e -> SearchMatch.tier(e, query).takeIf { it >= 0 }?.let { e.item to it } }
+            .sortedWith(compareBy<Pair<AppInfo, Int>> { if (it.first.key == top) 0 else 1 }
+                .thenBy { it.second }
+                .thenByDescending { picks.use(it.first.key) }
+                .thenByDescending { picks.recent(it.first.key) }
+                .thenByDescending { scores[it.first.key] ?: 0.0 })
+            .take(MAX_APPS).map { it.first }
+    }
 
     // ---------------------------------------------------------------------------------------------
     // fitting it all above the bar
@@ -524,14 +565,17 @@ class AppsSearch(
             val rows = ((left - gap + chipGap) / (chip + chipGap)).coerceIn(0, SUGGESTED_ROWS)
             showContacts(if (invite) emptyList() else contactsList.take(rows * 2), invite && rows > 0, chip)
             showWeb(emptyList())
+            showAnswer(null)
         } else {
+            showAnswer(answer)
+            val room = left - if (answer != null) dp.dpi(ANSWER_DP) + 2 * dp.dpi(CARD_PAD_DP) + gap else 0
             val chip = dp.dpi(CHIP_DP)
             fun height(rows: Int) = if (rows == 0) 0 else rows * chip + (rows - 1) * chipGap + gap
             fun webFits(h: Int) = ((h - gap - 2 * dp.dpi(CARD_PAD_DP)) / dp.dpi(ROW_DP)).coerceIn(0, MAX_WEB)
             var rows = if (invite) 1 else (contactsList.size + 1) / 2
-            while (rows > 0 && webFits(left - height(rows)) < 1) rows--
+            while (rows > 0 && webFits(room - height(rows)) < 1) rows--
             showContacts(if (invite) emptyList() else contactsList.take(rows * 2), invite && rows > 0, chip)
-            showWeb(webList.take(webFits(left - height(rows)).coerceAtLeast(1)))
+            showWeb(webList.take(webFits(room - height(rows)).coerceAtLeast(1)))
         }
         updateEnterTarget()
     }
@@ -555,7 +599,8 @@ class AppsSearch(
         list.forEachIndexed { i, a ->
             val v = IconView(context, dp).apply {
                 label = a.label; contentDescription = a.label
-                setOnClickListener { onLaunch(this, a) }
+                // what was typed when it was opened teaches the next search (before the launch clears the query)
+                setOnClickListener { sources.picked(normalize(field.text.toString()), a.key); onLaunch(this, a) }
                 configureIcon(this, a)
             }
             results.addCell(v, i % 4, i / 4)
@@ -563,8 +608,6 @@ class AppsSearch(
         }
         results.layoutParams = results.layoutParams.apply { height = if (list.isEmpty()) 0 else results.rows * dp.cellHeight }
     }
-
-    private fun initials(s: String) = s.split(' ', '-', '.').filter { it.isNotEmpty() }.joinToString("") { it.take(1) }
 
     // ---------------------------------------------------------------------------------------------
     // Google results
@@ -625,6 +668,82 @@ class AppsSearch(
         }
         web.addView(card)
         if (old.isEmpty()) reveal(card)
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // answers row (0.230): a sum, a settings page, or the Play Store
+    // ---------------------------------------------------------------------------------------------
+
+    /** One answer: [id] tells a changed one from the same one again (only a new one fades in). */
+    private class Answer(val id: String, val title: String, val subtitle: String, val icon: Drawable?, val glyph: String?, val run: (View) -> Unit)
+
+    /** Icons and resolved intents, looked up once per search (PackageManager calls on every keystroke add up). */
+    private val answerIcons = HashMap<String, Drawable?>()
+    private val settingIntents = HashMap<String, Intent?>()
+
+    /** A sum or conversion first, then a settings page, then (no app matched) the Play Store. */
+    private fun findAnswer(raw: String, query: String, apps: List<AppInfo>): Answer? {
+        SearchAnswers.calc(raw)?.let { c ->
+            return Answer("calc|${c.value}|${c.shown}", c.value, "${c.shown} · Tap to copy", calculatorIcon(), "=") { copy(c.value) }
+        }
+        SearchAnswers.setting(query)?.let { st ->
+            val intent = settingIntents.getOrPut(st.title) {
+                st.actions.asSequence().map { Intent(it) }.firstOrNull { it.resolveActivity(context.packageManager) != null }
+            }
+            if (intent != null) return Answer("set|${st.title}", st.title, "Settings · ${st.place}", answerIcons.getOrPut("set|${intent.action}") {
+                try { context.packageManager.resolveActivity(intent, 0)?.loadIcon(context.packageManager) } catch (_: Exception) { null }
+            }, null) { v -> onOpenIntent(v, Intent(intent)) }
+        }
+        if (apps.isEmpty() && query.length >= 3) {
+            val play = answerIcons.getOrPut("play") {
+                try { context.packageManager.getApplicationIcon(PLAY_STORE) } catch (_: Exception) { null }
+            }
+            if (play != null) return Answer("play|$raw", raw, "Look it up in the Play Store", play, null) { v ->
+                onOpenIntent(v, Intent(Intent.ACTION_VIEW, Uri.parse("market://search?q=" + Uri.encode(raw) + "&c=apps")).setPackage(PLAY_STORE))
+            }
+        }
+        return null
+    }
+
+    /** The phone's calculator app's icon, else null (an "=" is drawn instead). */
+    private fun calculatorIcon(): Drawable? = answerIcons.getOrPut("calc") {
+        try {
+            val i = Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_CALCULATOR)
+            context.packageManager.resolveActivity(i, 0)?.loadIcon(context.packageManager)
+        } catch (_: Exception) { null }
+    }
+
+    private fun copy(value: String) {
+        context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(ClipData.newPlainText("Result", value))
+        // Android 13 and later show their own confirmation
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) Toast.makeText(context, "Copied $value", Toast.LENGTH_SHORT).show()
+    }
+
+    /** One row in a card like Google's, only rebuilt (and faded in) when the answer changes. */
+    private fun showAnswer(a: Answer?) {
+        if (a?.id == shownAnswer) return
+        shownAnswer = a?.id
+        answerBox.removeAllViews()
+        answerBox.visibility = if (a == null) GONE else VISIBLE
+        if (a == null) return
+        val card = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply { cornerRadius = dp.dp(26f); setColor(0x1FFFFFFF) }
+            setPadding(0, dp.dpi(CARD_PAD_DP), 0, dp.dpi(CARD_PAD_DP))
+            clipToOutline = true
+        }
+        val leading: View = if (a.icon != null) ImageView(context).apply { setImageDrawable(a.icon) } else TextView(context).apply {
+            text = a.glyph ?: "="
+            gravity = Gravity.CENTER
+            setTextColor(0xFFFFFFFF.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            typeface = Fonts.ui(context, 600)
+            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(0xFFEA8600.toInt()) }
+        }
+        card.addView(row(leading, 36f, a.title, a.subtitle, true) { a.run(it) },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp.dpi(ANSWER_DP)))
+        answerBox.addView(card)
+        reveal(card)
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -792,7 +911,7 @@ class AppsSearch(
     /** Nothing is highlighted before a query is typed: "go" has nothing to open then. */
     private fun updateEnterTarget() {
         val target = if (field.text.isNullOrBlank()) null
-            else (results.getChildAt(0) as? IconView) ?: firstEnterable(contactsBox) ?: firstEnterable(web)
+            else (results.getChildAt(0) as? IconView) ?: firstEnterable(answerBox) ?: firstEnterable(contactsBox) ?: firstEnterable(web)
         if (target === enterTarget) return
         enterTarget?.let { it.background = when { it is IconView -> null; it.tag == CHIP -> chipBackground(shownChipHeight); else -> rowRipple() } }
         enterTarget = target
@@ -881,7 +1000,7 @@ class AppsSearch(
         val h = lerp(r.height(), dp.searchBarHeight.toFloat(), g)
         val margin = dp.dp(16f)
         val w = lerp(r.width(), dp.widthPx - 2 * margin, g)
-        val own = lerp(r.top, barTop(kb, dp.searchBarHeight.toFloat()), if (o.fade) 1f else f)
+        val own = lerp(r.top, barTop(kb, dp.searchBarHeight.toFloat()), if (o.fade) 1f else if (riseDriven) rise else f)
         // whichever is higher: the bar's own motion, or the keyboard pushing it up (never behind the keyboard)
         val top = if (ime > 0) minOf(own, barTop(ime.toFloat(), h)) else own
         val lp = pill.layoutParams
@@ -935,11 +1054,14 @@ class AppsSearch(
     }
 
     private fun rememberedKeyboard(): Float =
-        keyboardPrefs.getInt(keyboardKey, 0).takeIf { it > 0 }?.toFloat() ?: (dp.heightPx * 0.38f)   // first time: a typical phone keyboard
+        keyboardSpot.height(legacyKeyboardKey)?.toFloat() ?: (dp.heightPx * 0.38f)   // first time: a typical phone keyboard
 
-    /** The bar heads for a keyboard [h] px tall, eased over [duration] ms (0 = at once); shown heights are remembered. */
+    /**
+     * The bar heads for a keyboard [h] px tall, eased over [duration] ms (0 = at once). Nothing is remembered here:
+     * up to 0.229 every height seen was, so one odd one (caught partway, or still the last app's) misaimed the next
+     * open. [checkSettled] feeds [keyboardSpot] only keyboards that have settled under the search field.
+     */
     private fun retargetKeyboard(h: Float, duration: Long = Easing.IME_DURATION) {
-        if (h > 0f && keyboardPrefs.getInt(keyboardKey, 0) != h.roundToInt()) keyboardPrefs.edit().putInt(keyboardKey, h.roundToInt()).apply()
         if (h == kbTarget) return
         kbTarget = h
         kbAnim?.cancel()
@@ -955,16 +1077,49 @@ class AppsSearch(
         }
     }
 
+    /** The keyboard's height is learned once it has sat still under the search field for [SETTLE_MS]. */
+    private fun checkSettled() {
+        main.removeCallbacks(settled)
+        if (isOpen && ime > 0) main.postDelayed(settled, SETTLE_MS)
+    }
+
+    private val settled = Runnable {
+        val now = rootWindowInsets?.getInsets(WindowInsets.Type.ime())?.bottom ?: 0
+        // not while the finger holds it (Lift-Off) or it moves, and only for our own field
+        if (isOpen && !isLifting && imeControl == null && !imeAnimating && field.hasFocus() && now > 0 && now == ime) keyboardSpot.sample(now)
+    }
+
+    /** The bar starts rising: with the keyboard ([duration] and [interpolator] are its own), or without one after a wait. */
+    private fun startRise(duration: Long, interpolator: TimeInterpolator?) {
+        main.removeCallbacks(riseFallback)
+        if (!riseDriven || riseStarted) return
+        riseStarted = true
+        riseAnim = ValueAnimator.ofFloat(rise, 1f).apply {
+            this.duration = duration
+            this.interpolator = interpolator ?: Easing.IME
+            addUpdateListener { rise = it.animatedValue as Float; layoutPill() }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) { if (riseAnim === animation) { riseAnim = null; showCursor() } }
+            })
+            start()
+        }
+    }
+
     /** No keyboard came up (hardware keyboard, IME refused): settle at the bottom rather than float. */
     private val noKeyboard = Runnable { if (isOpen && ime == 0 && !imeAnimating) retargetKeyboard(0f) }
 
     /** [fromAbove]: a swipe down opened it, so the results drop into place instead of rising (same fade, length and curve). */
     fun open(from: Origin, fromAbove: Boolean = false) {
         sources.snapshot.let { scores = it.scores; suggested = it.contacts }
+        picks = sources.picks()
         origin = from
         isOpen = true
         visibility = VISIBLE
         kb = rememberedKeyboard(); kbTarget = kb
+        // rise with the keyboard, unless it's already up (then it just follows the morph) or the bar only fades in
+        riseDriven = !from.fade && ime == 0
+        riseStarted = false; rise = 0f; riseAnim?.cancel(); riseAnim = null
+        if (riseDriven) main.postDelayed(riseFallback, RISE_WAIT_MS)
         pickFrostInk()
         f = 0f
         layoutPill()
@@ -1026,6 +1181,16 @@ class AppsSearch(
         shutDown()
         content.animate().alpha(0f).translationY(if (lift) -dp.dp(OPEN_RISE_DP) else content.translationY).setDuration(150).start()
         dissolveQuery()
+        if (riseDriven) {
+            riseStarted = true
+            riseAnim?.cancel()
+            riseAnim = ValueAnimator.ofFloat(rise, 0f).apply {
+                duration = (MORPH_MS * abs(f)).toLong().coerceAtLeast(120L)
+                interpolator = Easing.IME
+                addUpdateListener { rise = it.animatedValue as Float; layoutPill() }
+                start()
+            }
+        }
         animateTo(0f) { onClose() }
     }
 
@@ -1035,6 +1200,8 @@ class AppsSearch(
         bounceWant = 0f; bounceAnim?.cancel()
         main.removeCallbacks(noKeyboard)
         main.removeCallbacks(keyboardRetry)
+        main.removeCallbacks(settled)
+        main.removeCallbacks(riseFallback)
         pendingFetch?.let { main.removeCallbacks(it) }
         pendingSources?.let { main.removeCallbacks(it) }
         net.shutdownNow()
@@ -1063,6 +1230,8 @@ class AppsSearch(
      */
     fun beginLift(from: Origin, fromAbove: Boolean = false) {
         sources.snapshot.let { scores = it.scores; suggested = it.contacts }
+        picks = sources.picks()
+        riseDriven = false                                       // the finger places the bar
         anim?.cancel()
         origin = from
         isOpen = true
@@ -1092,6 +1261,8 @@ class AppsSearch(
         origin = to
         shutDown()
         isLifting = true
+        // opened by tap and still rising: the finger takes over from wherever the bar is
+        if (riseDriven) { riseAnim?.cancel(); riseAnim = null; riseDriven = false; f = minOf(f, rise) }
         lift = f
         if (away) liftSign = -1f
         content.animate().cancel()
@@ -1223,6 +1394,7 @@ class AppsSearch(
     /** The typing cursor, once the bar has stopped moving (morph, results, lift and landing bounce all done). */
     private fun showCursor() {
         if (!isOpen || isLifting || anim?.isRunning == true || bounceAnim?.isRunning == true) return
+        if (riseDriven && rise < 1f) return                          // still rising with the keyboard
         if (content.alpha < 1f) return                               // the results are still coming in
         field.isCursorVisible = true
     }
@@ -1308,7 +1480,6 @@ class AppsSearch(
     companion object {
         /** Bar morph (open / close); the Home ⇄ Apps transition that goes with it uses the same length. */
         const val MORPH_MS = 300L
-        private val MARKS = Regex("\\p{Mn}+")
         private const val KEY_CONTACTS_DECLINED = "contacts_declined"
         private const val ROW_TALL = "tall"
         private const val CHIP = "chip"
@@ -1321,6 +1492,13 @@ class AppsSearch(
         private const val CARD_PAD_DP = 6f
         private const val MAX_APPS = 8
         private const val MAX_WEB = 5
+        /** The answers row's height. */
+        private const val ANSWER_DP = 60f
+        private const val PLAY_STORE = "com.android.vending"
+        /** A keyboard this still (ms) under the search field is a settled one, whose height can be learned. */
+        private const val SETTLE_MS = 350L
+        /** Opening by tap: how long the bar waits for the keyboard before it rises without it (an app's hands over in ~400 ms). */
+        private const val RISE_WAIT_MS = 600L
         private const val SUGGESTED_ROWS = SearchSources.MAX_SUGGESTED / 2
         /** Results rising in with the bar (MORPH_MS); the Apps screen's grid comes in the same way after a swipe up. */
         const val OPEN_MS = 425L

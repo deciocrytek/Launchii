@@ -17,8 +17,8 @@ android {
         applicationId = "app.launchii"
         minSdk = 33
         targetSdk = 36
-        versionCode = 228
-        versionName = "0.228"
+        versionCode = 248
+        versionName = "0.248"
     }
 
     signingConfigs {
@@ -54,4 +54,6 @@ dependencies {
     implementation("androidx.recyclerview:recyclerview:1.4.0")
     // installs src/main/baseline-prof.txt for sideloaded APKs (no Play cloud profiles)
     implementation("androidx.profileinstaller:profileinstaller:1.4.0")
+    // search matching and answers (plain Kotlin) are unit tested
+    testImplementation("junit:junit:4.13.2")
 }
