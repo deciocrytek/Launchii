@@ -53,6 +53,35 @@ class SettingsActivity : OneUiPage() {
         finish()
     }
 
+    /** Earlier layouts (WorkspaceModel snapshots): pick one to put back on Home. */
+    private fun restoreLayout() {
+        val home = com.oneuiclone.home.Launcher.live?.get()
+        val repo = com.oneuiclone.home.model.AppRepository(this, com.oneuiclone.home.icons.IconFactory(this), 1)
+        val model = com.oneuiclone.home.model.WorkspaceModel(this, repo)
+        val snaps = model.snapshots()
+        val dialog = AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert).setTitle("Restore Home screen layout")
+        if (snaps.isEmpty()) {
+            repo.destroy()
+            dialog.setMessage("No earlier layouts yet. One is saved every hour while you change your Home screen, and whenever most of it disappears at once.")
+                .setPositiveButton(android.R.string.ok, null).show()
+            return
+        }
+        val fmt = android.text.format.DateFormat.getMediumDateFormat(this)
+        val time = android.text.format.DateFormat.getTimeFormat(this)
+        val rows = snaps.map { s ->
+            val d = java.util.Date(s.time)
+            fun n(k: Int, one: String) = if (k == 1) "1 $one" else "$k ${one}s"
+            val parts = listOfNotNull(n(s.apps, "app"), s.folders.takeIf { it > 0 }?.let { n(it, "folder") }, s.widgets.takeIf { it > 0 }?.let { n(it, "widget") })
+            "${fmt.format(d)}, ${time.format(d)}\n${parts.joinToString(" · ")}"
+        }
+        dialog.setItems(rows.toTypedArray()) { _, i ->
+            val ok = home?.restoreLayout(snaps[i]) ?: run { model.load(); model.restore(snaps[i]) }
+            android.widget.Toast.makeText(this, if (ok) "Home screen layout restored" else "Couldn't restore that layout", android.widget.Toast.LENGTH_SHORT).show()
+        }.setNegativeButton(android.R.string.cancel, null)
+            .setOnDismissListener { repo.destroy() }
+            .show()
+    }
+
     override fun build() {
         list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12f), 0, dp(12f), dp(24f)) }
         // extended app bar (≈ 30 % of the screen, title centred)
@@ -89,6 +118,7 @@ class SettingsActivity : OneUiPage() {
         card {
             toggle("Lock Home screen layout", "Prevent items on the Home screen from being removed or repositioned.", prefs.lockLayout) { prefs.lockLayout = it }
             toggle("Add new apps to Home screen", null, prefs.addNewApps) { prefs.addNewApps = it }
+            item("Restore Home screen layout", "Go back to an earlier layout, saved automatically") { restoreLayout() }
             // Swipe down for search takes over both other swipes, so turning it on turns them off (and either of them, it)
             lateinit var downNotif: Switch
             lateinit var downSearch: Switch

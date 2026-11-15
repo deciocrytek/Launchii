@@ -404,7 +404,9 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
                 it.themeColor = prefs.themeColor
             }
             repo = nr
-            model = WorkspaceModel(activity, nr)
+            // read the layout now, not when the app list arrives: until then the model is empty, and a save in between
+            // (a new page, a widget) wrote that over the real layout
+            model = WorkspaceModel(activity, nr).also { it.load() }
             nr.addListener(this)
             nr.reload()
         } else {
@@ -533,9 +535,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         searchSources.refresh()                        // first run: suggestions ready before search first opens
         if (prefs.zoomInOpen || prefs.wallpaperOpen) splashLook.prefetch(apps.map { it.activityInfo })
         val m = model ?: return
-        if (!bound && m.items.isEmpty()) {
-            if (!m.load()) { m.createDefault(dp.homeCols, dp.homeRows); firstRun = true }
-        }
+        if (!m.ready && !m.load()) { m.createDefault(dp.homeCols, dp.homeRows); firstRun = true }
         m.prune()
         if (knownApps.isNotEmpty() && prefs.addNewApps) {
             // an app back from an update was "new" to the last list but kept its spot (prune): not a second icon
@@ -3179,6 +3179,15 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             }
         }
         return null
+    }
+
+    /** Settings › Restore Home screen layout. */
+    fun restoreLayout(snap: com.oneuiclone.home.model.WorkspaceModel.Snapshot): Boolean {
+        val m = model ?: return false
+        if (!m.restore(snap)) return false
+        reflowGrid(m)
+        bindWorkspace()
+        return true
     }
 
     fun destroy() {

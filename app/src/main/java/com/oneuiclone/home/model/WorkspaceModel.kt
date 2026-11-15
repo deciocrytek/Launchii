@@ -97,37 +97,76 @@ class WorkspaceModel(private val context: Context, private val repo: AppReposito
                 x < it.x + it.spanX && x + sx > it.x && y < it.y + it.spanY && y + sy > it.y
         }
 
+    /**
+     * Whether [items] came from disk (or a snapshot, or [createDefault]). Until then they're just the empty list a new
+     * model starts with, and [save] would write that over the real layout: a cold start's few seconds before the app
+     * list arrives were enough for any save (a new page, a widget) to leave Home blank for good.
+     */
+    var ready = false
+        private set
+
+    /** Snapshots of earlier layouts (newest first), see [save] and [restore]. */
+    private val snapDir = File(context.filesDir, "layouts")
+    /** Item count of the file on disk, to notice a save that drops most of the layout. */
+    private var savedCount = -1
+
+    /**
+     * Reads the layout. A file that won't parse is kept aside (never overwritten by a default) and the newest snapshot
+     * is used instead; so is a snapshot when the file is missing but snapshots exist.
+     */
     fun load(): Boolean {
-        if (!file.exists()) return false
-        return try {
-            val root = JSONObject(file.readText())
-            pageCount = root.optInt("pages", 1)
-            nextId = root.optLong("nextId", 1)
-            items.clear()
-            val arr = root.getJSONArray("items")
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                val c = Container.valueOf(o.getString("c"))
-                when (o.getString("t")) {
-                    "app" -> AppKey.parse(o.getString("k"))?.let {
-                        items += HomeItem.App(o.getLong("id"), it, c, o.getInt("s"), o.getInt("x"), o.getInt("y"),
-                            o.optLong("f", -1), o.optInt("r", 0))
-                    }
-                    "widget" -> android.content.ComponentName.unflattenFromString(o.getString("p"))?.let {
-                        items += HomeItem.Widget(o.getLong("id"), o.getInt("wid"), it, c, o.getInt("s"), o.getInt("x"), o.getInt("y"),
-                            o.getInt("sx"), o.getInt("sy"))
-                    }
-                    "folder" -> items += HomeItem.Folder(o.getLong("id"), o.getString("title"), c, o.getInt("s"),
-                        o.getInt("x"), o.getInt("y"), o.optInt("color", 0), o.optBoolean("large", false))
-                }
-            }
-            true
-        } catch (e: Exception) {
-            false
+        if (file.exists()) {
+            if (parse(file)) { ready = true; savedCount = items.size; return true }
+            val bad = File(context.filesDir, "workspace-broken-${System.currentTimeMillis()}.json")
+            try { file.copyTo(bad, overwrite = true); file.delete() } catch (_: Exception) {}
+            android.util.Log.w("OneUiHome", "layout: workspace.json unreadable (${bad.length()} bytes), kept as ${bad.name}")
         }
+        for (snap in snapshotFiles()) {
+            if (parse(snap)) {
+                android.util.Log.w("OneUiHome", "layout: restored from snapshot ${snap.name} (${items.size} items)")
+                ready = true; savedCount = -1      // written back on the next save
+                return true
+            }
+        }
+        items.clear()
+        return false
+    }
+
+    private fun parse(f: File): Boolean = try {
+        val root = JSONObject(f.readText())
+        val list = ArrayList<HomeItem>()
+        val arr = root.getJSONArray("items")
+        for (i in 0 until arr.length()) {
+            val o = arr.getJSONObject(i)
+            val c = Container.valueOf(o.getString("c"))
+            when (o.getString("t")) {
+                "app" -> AppKey.parse(o.getString("k"))?.let {
+                    list += HomeItem.App(o.getLong("id"), it, c, o.getInt("s"), o.getInt("x"), o.getInt("y"),
+                        o.optLong("f", -1), o.optInt("r", 0))
+                }
+                "widget" -> android.content.ComponentName.unflattenFromString(o.getString("p"))?.let {
+                    list += HomeItem.Widget(o.getLong("id"), o.getInt("wid"), it, c, o.getInt("s"), o.getInt("x"), o.getInt("y"),
+                        o.getInt("sx"), o.getInt("sy"))
+                }
+                "folder" -> list += HomeItem.Folder(o.getLong("id"), o.getString("title"), c, o.getInt("s"),
+                    o.getInt("x"), o.getInt("y"), o.optInt("color", 0), o.optBoolean("large", false))
+            }
+        }
+        pageCount = root.optInt("pages", 1)
+        nextId = maxOf(root.optLong("nextId", 1), (list.maxOfOrNull { it.id } ?: 0) + 1)
+        items.clear()
+        items.addAll(list)
+        true
+    } catch (e: Exception) {
+        android.util.Log.w("OneUiHome", "layout: can't read ${f.name}: $e")
+        false
     }
 
     fun save() {
+        if (!ready) {
+            android.util.Log.w("OneUiHome", "layout: save before load refused (${items.size} items)", Throwable())
+            return
+        }
         val arr = JSONArray()
         for (it in items) {
             val o = JSONObject().put("id", it.id).put("c", it.container.name).put("s", it.screen).put("x", it.x).put("y", it.y)
@@ -140,9 +179,75 @@ class WorkspaceModel(private val context: Context, private val repo: AppReposito
             arr.put(o)
         }
         val root = JSONObject().put("pages", pageCount).put("nextId", nextId).put("items", arr)
+        snapshotBefore(items.size)
         val tmp = File(file.path + ".tmp")
-        tmp.writeText(root.toString())
-        tmp.renameTo(file)
+        try {
+            java.io.FileOutputStream(tmp).use { out ->
+                out.write(root.toString().toByteArray())
+                out.fd.sync()                           // a rename that lands before the data would leave an empty file
+            }
+            if (!tmp.renameTo(file)) android.util.Log.w("OneUiHome", "layout: rename failed")
+            savedCount = items.size
+        } catch (e: Exception) {
+            android.util.Log.w("OneUiHome", "layout: save failed: $e")
+        }
+    }
+
+    /**
+     * Copies the file on disk into [snapDir] before it's replaced: at most once an hour as a matter of course, and
+     * always when the new layout has under half the items (whatever caused that, the old one can be restored).
+     */
+    private fun snapshotBefore(newCount: Int) {
+        if (!file.exists() || file.length() == 0L) return
+        val newest = snapshotFiles().firstOrNull()
+        val now = System.currentTimeMillis()
+        val big = savedCount >= 4 && newCount * 2 < savedCount
+        if (!big && newest != null && now - newest.lastModified() < 60 * 60 * 1000L) return
+        try {
+            snapDir.mkdirs()
+            file.copyTo(File(snapDir, "workspace-$now.json"), overwrite = true)
+            if (big) android.util.Log.w("OneUiHome", "layout: $savedCount → $newCount items, snapshot kept", Throwable())
+            snapshotFiles().drop(MAX_SNAPSHOTS).forEach { it.delete() }
+        } catch (e: Exception) {
+            android.util.Log.w("OneUiHome", "layout: snapshot failed: $e")
+        }
+    }
+
+    private fun snapshotFiles(): List<File> =
+        snapDir.listFiles { f -> f.name.startsWith("workspace-") && f.name.endsWith(".json") }
+            ?.sortedByDescending { it.name.removePrefix("workspace-").removeSuffix(".json").toLongOrNull() ?: 0 }
+            .orEmpty()
+
+    /** A saved earlier layout, for Settings › Restore Home screen layout. */
+    class Snapshot(val file: File, val time: Long, val apps: Int, val folders: Int, val widgets: Int)
+
+    fun snapshots(): List<Snapshot> = snapshotFiles().mapNotNull { f ->
+        try {
+            val arr = JSONObject(f.readText()).getJSONArray("items")
+            var apps = 0; var folders = 0; var widgets = 0
+            for (i in 0 until arr.length()) when (arr.getJSONObject(i).optString("t")) {
+                "app" -> apps++; "folder" -> folders++; "widget" -> widgets++
+            }
+            Snapshot(f, f.name.removePrefix("workspace-").removeSuffix(".json").toLongOrNull() ?: f.lastModified(), apps, folders, widgets)
+        } catch (_: Exception) { null }
+    }
+
+    /** Replaces the layout with [snap]'s (the current one is snapshotted first, so a restore can be undone). */
+    fun restore(snap: Snapshot): Boolean {
+        val keep = ArrayList(items); val keepPages = pageCount; val keepNext = nextId
+        if (!parse(snap.file)) { items.clear(); items.addAll(keep); pageCount = keepPages; nextId = keepNext; return false }
+        ready = true
+        savedCount = -1
+        if (file.exists()) try {
+            snapDir.mkdirs()
+            file.copyTo(File(snapDir, "workspace-${System.currentTimeMillis()}.json"), overwrite = true)
+        } catch (_: Exception) {}
+        save()
+        return true
+    }
+
+    companion object {
+        const val MAX_SNAPSHOTS = 10
     }
 
     /**
@@ -201,6 +306,7 @@ class WorkspaceModel(private val context: Context, private val repo: AppReposito
      * and anything that no longer fits is left out.
      */
     fun createDefault(cols: Int, rows: Int) {
+        ready = true
         items.clear()
         nextId = 1
         pageCount = 2
