@@ -80,8 +80,8 @@ import kotlin.math.roundToInt
  * suggested contacts stretched to fill the space; both come from [SearchSources.snapshot], taken as the search
  * opens, so nothing reshuffles on screen. Everything is sized to fit above the bar and nothing ever scrolls, so a
  * swipe down anywhere goes back Home. The results fade and slide up together as the bar opens; while typing,
- * whatever changed just fades in. The result IME "go" opens is highlighted (Pixel launcher): the first app, else
- * contact, else the typed query on Google.
+ * whatever changed just fades in. The result IME "go" opens is highlighted (Pixel launcher): the first app, else a
+ * sum or Settings answer, else contact, else the Play Store answer, else the typed query on Google.
  *
  * From Home it opens by Lift-Off ([beginLift]): the launcher feeds it the finger's progress ([setLift]) and then a
  * spring's, and the bar, the results (growing out of the bar from 92%, rising into focus) and the keyboard, which it
@@ -908,10 +908,17 @@ class AppsSearch(
         return null
     }
 
-    /** Nothing is highlighted before a query is typed: "go" has nothing to open then. */
+    /**
+     * Nothing is highlighted before a query is typed: "go" has nothing to open then. The Play Store answer is only a
+     * fallback for "no app matched", so a matching contact goes first ("kyle" opens Kyle, not a Play Store search).
+     */
     private fun updateEnterTarget() {
+        val playAnswer = shownAnswer?.startsWith("play|") == true
         val target = if (field.text.isNullOrBlank()) null
-            else (results.getChildAt(0) as? IconView) ?: firstEnterable(answerBox) ?: firstEnterable(contactsBox) ?: firstEnterable(web)
+            else (results.getChildAt(0) as? IconView)
+                ?: (if (playAnswer) firstEnterable(contactsBox) ?: firstEnterable(answerBox)
+                    else firstEnterable(answerBox) ?: firstEnterable(contactsBox))
+                ?: firstEnterable(web)
         if (target === enterTarget) return
         enterTarget?.let { it.background = when { it is IconView -> null; it.tag == CHIP -> chipBackground(shownChipHeight); else -> rowRipple() } }
         enterTarget = target

@@ -44,6 +44,7 @@ class LauncherActivity : Activity() {
         AnimLog.log("onStart")
         launcher.background.attach()
         launcher.widgets.start()
+        launcher.onStart()
     }
 
     override fun onResume() {

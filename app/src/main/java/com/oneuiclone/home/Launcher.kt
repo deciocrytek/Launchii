@@ -64,6 +64,14 @@ private const val LAUNCH_WAIT_MS = 400L
 /** Longest the close zoom waits for Home to be put back on screen, on phones that never send a gesture contract. */
 private const val RETURN_WAIT_MS = 2000L
 private const val KEY_CONTRACT_SEEN = "contract_seen"
+private const val KEY_SLOW_RETURN = "slow_return"
+private const val KEY_SLOW_STREAK = "slow_return_streak"
+/** Slow full first frames back in a row before returns count as slow. */
+private const val SLOW_RETURN_STREAK = 3
+/** A full first frame back slower than this marks returns on this phone as slow (half of it clears the mark). */
+private const val SLOW_RETURN_MS = 350L
+/** Longest Home stays empty waiting for its first frame back to be drawn. */
+private const val LIGHT_FRAME_MAX_MS = 1000L
 /**
  * Home-button close: longest Home's wallpaper copy covers for the hidden real one (the close normally finishes in
  * ~225 ms; enter-complete came up to ~770 ms after the home intent on the Pixel), and its fade off the real one.
@@ -1536,6 +1544,88 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
      */
     private val closeState = activity.getSharedPreferences("close_state", android.content.Context.MODE_PRIVATE)
     private var contractSeen = closeState.getBoolean(KEY_CONTRACT_SEEN, false)
+
+    /**
+     * A slow phone's way back from an app (Redmi A5, Android 15 Go; traced on the emulator, 2026-11-15): Home's
+     * window has to draw a frame before the system can fold it into the close (the recents transition merges Home's
+     * opening only once that frame is in). Behind an app Home was trimmed (TRIM_MEMORY_BACKGROUND drops the renderer's
+     * whole GPU context) or killed, so the first frame back rebuilt everything: 440–780 ms on the emulator, more on
+     * the Go phone. The close was over by then, Home showed separately afterwards (the "blank screen" between the app
+     * and Home), and on a cold start the contract reply was too late to land the window on its icon.
+     * So the first frame back is drawn empty (the wallpaper the close shows anyway), which is quick; Home's content
+     * follows on the next frame while the close is still running. There's no landing surface (see [handleContract]).
+     * Only where returns are slow: a low-RAM (Go) phone, or one whose full first frame back took over
+     * [SLOW_RETURN_MS] three times running. The Pixel's first frame is quick, and its close is left exactly as it was.
+     */
+    private val lowRam = activity.getSystemService(android.app.ActivityManager::class.java).isLowRamDevice
+    private var slowReturns = closeState.getBoolean(KEY_SLOW_RETURN, false)
+    private var slowStreak = closeState.getInt(KEY_SLOW_STREAK, 0)
+    /** The empty first frame is up: Home's content waits for it to be drawn. */
+    private var lightFrame = false
+    private val lightFrameCap = Runnable { endLightFrame("cap") }
+    /** When the frame being timed (Home's first full frame back) was asked for; 0 when not timing. */
+    private var returnFrameAt = 0L
+    /** This Launcher has drawn a frame (a new one after the process was killed hasn't). */
+    private var drawnOnce = false
+
+    private fun lightReturns() = lowRam || slowReturns
+
+    /** The first frame back from an app: drawn empty where returns are slow, timed everywhere. */
+    private fun returningToHome(why: String) {
+        if (lightFrame) return
+        val now = android.os.SystemClock.uptimeMillis()
+        if (!lightReturns()) {
+            if (returnFrameAt == 0L) { returnFrameAt = now; afterNextCommit { timeReturnFrame() } }
+            return
+        }
+        lightFrame = true
+        root.visibility = View.INVISIBLE
+        root.removeCallbacks(lightFrameCap)
+        root.postDelayed(lightFrameCap, LIGHT_FRAME_MAX_MS)
+        AnimLog.log("light first frame ($why)")
+        afterNextCommit { endLightFrame("drawn") }
+    }
+
+    private fun endLightFrame(source: String) {
+        if (!lightFrame) return
+        lightFrame = false
+        root.removeCallbacks(lightFrameCap)
+        root.visibility = View.VISIBLE
+        AnimLog.log("light frame over ($source): Home's content draws")
+        returnFrameAt = android.os.SystemClock.uptimeMillis()
+        afterNextCommit { timeReturnFrame() }
+    }
+
+    /** Home's first full frame back is in: remember whether returns on this phone are slow. */
+    private fun timeReturnFrame() {
+        val at = returnFrameAt
+        if (at == 0L) return
+        returnFrameAt = 0L
+        val ms = android.os.SystemClock.uptimeMillis() - at
+        // one slow return (the first after an update, a cold process) doesn't mark a quick phone: it takes a streak
+        val streak = if (ms > SLOW_RETURN_MS) slowStreak + 1 else 0
+        val slow = if (slowReturns) ms > SLOW_RETURN_MS / 2 else streak >= SLOW_RETURN_STREAK
+        AnimLog.log("full frame back took $ms ms (streak $streak)${if (slow != slowReturns) ", slow returns: $slow" else ""}")
+        slowStreak = streak
+        if (slow != slowReturns) slowReturns = slow
+        closeState.edit().putBoolean(KEY_SLOW_RETURN, slow).putInt(KEY_SLOW_STREAK, streak).apply()
+    }
+
+    /** [block] on the main thread once the next frame has been handed to the renderer and drawn. */
+    private fun afterNextCommit(block: () -> Unit) {
+        if (!root.isAttachedToWindow) {
+            // a new Home's window isn't added until after onResume
+            root.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) { v.removeOnAttachStateChangeListener(this); afterNextCommit(block) }
+                override fun onViewDetachedFromWindow(v: View) {}
+            })
+            return
+        }
+        val vto = root.viewTreeObserver
+        if (!vto.isAlive) { root.post(block); return }
+        vto.registerFrameCommitCallback { root.post(block) }
+        root.invalidate()
+    }
     /** Home was stopped behind an app with a close zoom armed, and the system hasn't finished putting it back. */
     private var homeCovered = false
     /** The close zoom is held until Home is on screen again (see [playReturnAnimation]). */
@@ -2214,7 +2304,15 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         BadgeService.removeListener(badgeListener)
     }
 
+    /** Before the first frame back: a close into Home (Home was stopped behind an app with the close armed). */
+    fun onStart() {
+        if (homeCovered && awake()) returningToHome("start")
+    }
+
     fun onStop() {
+        endLightFrame("stopped")
+        returnFrameAt = 0L
+        drawnOnce = true
         stoppedSinceResume = true
         buttonClose = false
         dropAnim?.let { dropAnim = null; it.cancel() }   // settles Home before the close is armed below
@@ -2437,6 +2535,9 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
 
     fun onNewIntent(intent: Intent, alreadyOnHome: Boolean) {
         android.util.Log.i("OneUiHome", "onNewIntent extras=" + intent.extras?.keySet() + " onHome=" + alreadyOnHome)
+        // a new Home (its process was killed behind the app) starts drawing from nothing: same empty first frame
+        if (!alreadyOnHome && !drawnOnce) returningToHome("new instance")
+        drawnOnce = true
         if (!alreadyOnHome) {
             // Home asked for while an open is still in flight: an app tapped during a close and still held never
             // starts, and a card that hasn't been covered yet shrinks back into its icon with the close
@@ -2620,6 +2721,20 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         val pos = RectF(rect)
         finishContract()
         contractTarget = target
+        // position first, surface as soon as it exists (the recents process takes the latest message)
+        c.sendEndPosition(pos, null) { finishContract() }
+        // A slow phone has no time for the surface: its own buffer and draw held Home's content back by 150–200 ms
+        // on the emulator, past the end of the close. The window lands on the real icon, which stays shown.
+        if (lightReturns()) {
+            AnimLog.log("slow returns: no landing surface")
+            return target
+        }
+        addLandingSurface(c, target, rect, pos, draw)
+        return target
+    }
+
+    private fun addLandingSurface(c: GestureNavContract, target: CloseTarget, rect: Rect, pos: RectF,
+                                  draw: (android.graphics.Canvas) -> Unit) {
         target.setHidden(true)
         val sv = android.view.SurfaceView(activity)
         sv.setZOrderOnTop(true)
@@ -2638,10 +2753,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         })
         overlay.addView(sv, FrameLayout.LayoutParams(rect.width(), rect.height()).apply { leftMargin = rect.left; topMargin = rect.top })
         iconSurface = sv
-        // position first, surface as soon as it exists (the recents process takes the latest message)
-        c.sendEndPosition(pos, null) { finishContract() }
         root.postDelayed({ if (iconSurface === sv) finishContract() }, 2000)
-        return target
     }
 
     /**

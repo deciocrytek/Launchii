@@ -44,6 +44,12 @@ class IconFactory(private val context: Context) {
         val FORCE_TONAL = setOf("com.t3tools.t3code")
         /** Chrome, drawn as One UI shows it ([createChrome]) rather than from its own icon, whose layout varies by version. */
         private val CHROME = setOf("com.android.chrome", "com.chrome.beta", "com.chrome.dev", "com.chrome.canary")
+        /**
+         * Clear Colour: apps whose plate-coloured parts inside the symbol stay filled ([fillEnclosed]) rather than cut
+         * out to glass, as the date on Calendar's page (user, 0.254: its "31" went see-through). YT Music's ring and
+         * WhatsApp's handset are still cut.
+         */
+        private val CLEAR_KEEP_INSIDE = setOf("com.google.android.calendar", "com.samsung.android.calendar")
         /** The logo's width as a share of the plate (One UI's Chrome: ≈ 74 %). */
         private const val CHROME_LOGO_FRACTION = 0.74f
         /** The Chrome logo's white ring (around the blue centre), as a share of its radius. */
@@ -134,7 +140,7 @@ class IconFactory(private val context: Context) {
         private const val CLEAR_SHEEN = 0x45FFFFFF
         private const val CLEAR_SHADOW = 0.26f
         /** Chrome's logo radius, as a share of the icon. */
-        private const val CLEAR_CHROME_RADIUS = 0.3f
+        private const val CLEAR_CHROME_RADIUS = 0.37f
         /** A foreground still covering more than this share of the icon once its plate's colour is cut out is the whole art: shown whole. */
         private const val CLEAR_FULL_ART = 0.8f
         /** Under this share left, the cut took the whole symbol. */
@@ -861,6 +867,9 @@ class IconFactory(private val context: Context) {
      * out like a real monochrome glyph; illustrations keep their shading. [plateAlpha] as for [createThemed]: the
      * plate is see-through by that much, the glyph (and detail moving away from the plate) stays solid.
      * [glyphOnly]: just the white glyph, for Minimal icons ([minimal]); [bare] leaves out Minimal's shadow (Dot, Prism).
+     * A see-through plate ([plateAlpha] below 1, Frosted) gets the white glyph alone over it, as [createThemed] draws the
+     * monochrome layer: the tones toward the accent made art like Monopoly GO's come out pink among white symbols, and
+     * paler in a closed folder (whose preview is the white glyph) than open (user, 0.252).
      */
     fun createTonal(src: Drawable, size: Int, night: Boolean = isNight(), plateAlpha: Float = 1f, glyphOnly: Boolean = false,
                     bare: Boolean = false): Bitmap {
@@ -932,6 +941,15 @@ class IconFactory(private val context: Context) {
             val dn = Math.pow((-d / from).coerceIn(0f, 1f).toDouble(), 0.9).toFloat()
             // glyph only: faint detail (a tile a shade off its background) would show as a see-through square
             if (glyphOnly) { px[i] = Color.argb((255 * smooth(0.22f, 0.6f, up)).roundToInt(), 255, 255, 255); continue }
+            if (plateAlpha < 1f) {
+                // the white glyph (as glyphOnly) over the plate at plateAlpha, composited
+                val g = smooth(0.22f, 0.6f, up)
+                val pa = plateAlpha.coerceIn(0f, 1f) * (1f - g)
+                val a = pa + g
+                fun ch(p: Int) = if (a <= 0f) 0 else ((p * pa + 255 * g) / a).roundToInt().coerceIn(0, 255)
+                px[i] = Color.argb((255 * a).roundToInt().coerceIn(0, 255), ch(Color.red(plate)), ch(Color.green(plate)), ch(Color.blue(plate)))
+                continue
+            }
             val solid = max(up, dn)
             px[i] = Color.argb((255 * (plateAlpha + (1f - plateAlpha) * solid)).roundToInt().coerceIn(0, 255),
                 tone(Color.red(plate), Color.red(glyph), Color.red(away), up, dn),
@@ -1197,6 +1215,40 @@ class IconFactory(private val context: Context) {
         }
     }
 
+    /**
+     * Clear Colour ([CLEAR_KEEP_INSIDE]): the cut-out parts walled in by the symbol's solid art (Calendar's date)
+     * get back the icon as drawn, its foreground over its own plate, so they show filled, not as glass. Cut-out parts
+     * joined to the icon's edge (through anything short of solid) stay glass, as does the symbol's own soft outer edge.
+     */
+    private fun fillEnclosed(px: IntArray, drawn: IntArray, bg: IntArray, size: Int) {
+        val n = size * size
+        val open = BooleanArray(n)
+        val stack = IntArray(n)
+        var top = 0
+        fun push(i: Int) { if (!open[i] && Color.alpha(px[i]) < 250) { open[i] = true; stack[top++] = i } }
+        for (k in 0 until size) { push(k); push((size - 1) * size + k); push(k * size); push(k * size + size - 1) }
+        while (top > 0) {
+            val i = stack[--top]
+            val x = i % size
+            val y = i / size
+            if (x > 0) push(i - 1)
+            if (x < size - 1) push(i + 1)
+            if (y > 0) push(i - size)
+            if (y < size - 1) push(i + size)
+        }
+        for (i in 0 until n) {
+            if (open[i] || Color.alpha(px[i]) == 255) continue
+            val b = bg[i]
+            val f = drawn[i]
+            val fa = Color.alpha(f) / 255f
+            val ba = Color.alpha(b) / 255f * (1f - fa)
+            val a = fa + ba
+            if (a <= 0f) continue
+            fun ch(fc: Int, bc: Int) = ((fc * fa + bc * ba) / a).roundToInt().coerceIn(0, 255)
+            px[i] = Color.argb((a * 255).roundToInt(), ch(Color.red(f), Color.red(b)), ch(Color.green(f), Color.green(b)), ch(Color.blue(f), Color.blue(b)))
+        }
+    }
+
     /** Light from above on a Clear Colour symbol: a white sheen over its top, gone by about 60 % of the way down. Off with Icon contour. */
     private fun clearSheen(glyph: Bitmap) {
         if (!iconShine) return
@@ -1277,6 +1329,7 @@ class IconFactory(private val context: Context) {
                 if (k < 1f) px[i] = (px[i] and 0x00FFFFFF) or ((a * k).roundToInt() shl 24)
             }
             unmixEdges(px, drawn, bg, size)
+            if (pkg in CLEAR_KEEP_INSIDE) fillEnclosed(px, drawn, bg, size)
             // nothing left (the symbol was all plate colour) shows the icon whole too
             if (coverage(px, size) in CLEAR_EMPTY..CLEAR_FULL_ART) {
                 var weight = 0f
@@ -1863,6 +1916,23 @@ class IconFactory(private val context: Context) {
             }
         }
         return if (r < 0) Rect() else Rect(l, t, r + 1, bt + 1)
+    }
+
+    /**
+     * A see-through theme's folder preview (the symbol alone, AppInfo.previewIcon) with the icons' contour along its
+     * edge and no plate, so each app keeps a faint outline on the folder's glass (user, 0.250, after 0.238 took the
+     * whole edge away). Off with Icon contour, as on Home. A new bitmap; [symbol] is left as it is.
+     */
+    fun withContour(symbol: Bitmap): Bitmap {
+        if (!iconShine) return symbol
+        val out = symbol.copy(Bitmap.Config.ARGB_8888, true) ?: return symbol
+        val size = out.width
+        val c = Canvas(out)
+        c.save()
+        c.clipPath(maskPath(size.toFloat()))     // the rims (and the stroked ones of other shapes) stay inside the shape
+        applyEmboss(c, size)
+        c.restore()
+        return out
     }
 
     private fun applyEmboss(c: Canvas, size: Int) {

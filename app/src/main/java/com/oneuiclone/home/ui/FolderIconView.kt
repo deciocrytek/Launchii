@@ -191,14 +191,25 @@ open class FolderIconView(context: Context, dp: DeviceProfile) : IconView(contex
         outlineKey = key
         outlinePath.reset()
         shape.transform(Matrix().apply { setScale(scale, scale, iconSize / 2f, iconSize / 2f) }, outlinePath)
-        for (i in 0 until n) {
+        if (n > 0) outlinePath.op(appShapes(), Path.Op.UNION)
+        return outlinePath
+    }
+
+    /**
+     * The preview apps' shapes, joined, in icon coordinates: what the outline adds to the plate where they poke past it
+     * (Pixel's four, Outside). A pop-up or full folder closing into the icon lands on the plate and these together, so
+     * the icon taking over doesn't add them in one frame (recording 7000: Pixel folders landed as a plain circle).
+     */
+    fun appShapes(): Path {
+        val out = Path()
+        for (i in 0 until minOf(previewSlots, previews.size)) {
             if (i in hiddenPreviews) continue
             childRect(i, outlineRect)
             val app = IconShape.path(outlineRect.width())
             app.offset(outlineRect.left, outlineRect.top)
-            outlinePath.op(app, Path.Op.UNION)
+            out.op(app, Path.Op.UNION)
         }
-        return outlinePath
+        return out
     }
 
     /** Position of preview child [rank] relative to icon top-left. */

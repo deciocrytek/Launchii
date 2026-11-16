@@ -39,8 +39,8 @@ class AppInfo(
     val drawerIcon: Bitmap = icon,
     /**
      * In a closed folder's preview: [icon], but for the see-through themes (Frosted, Clear Colour) the symbol alone
-     * (Minimal, Minimal Colour), so the folder's own glass is the only plate there and no circle shows round each app
-     * (user, 0.238).
+     * (Minimal, Minimal Colour), so the folder's own glass is the only plate there (user, 0.238), with the icons'
+     * faint contour along each app's edge when Icon contour is on (user, 0.250).
      */
     val previewIcon: Bitmap = icon,
 )
@@ -158,7 +158,7 @@ class AppRepository(private val context: Context, private val iconFactory: IconF
                                 false, pkg, false, com.oneuiclone.home.icons.IconFactory.LOOK_MINIMAL_COLOUR, iconMode).first
                             iconLook.isEmpty() && plateAlpha < 1f -> iconFactory.homeIcon(d, size, night, true, themeAllApps, 1f, false, pkg, true, "", iconMode).first
                             else -> null
-                        }
+                        }?.let { iconFactory.withContour(it) }      // a faint edge round each app in the folder, no plate
                         iconFactory.homeIcon(d, size, night, themedIcons, themeAllApps, plateAlpha, darkIcons, pkg, minimalIcons, iconLook, iconMode)
                     }
                     result += AppInfo(key, user, info.label.toString(), icon, info, plain, preview ?: icon)

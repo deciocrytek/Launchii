@@ -360,7 +360,15 @@ class FolderController(
         val popup = p.isPopup
         // (the icon's fill as the icon draws it: its colour at the folder's fill opacity)
         if (popup) p.prepareReveal((icon.bgColor and 0x00FFFFFF) or
-            ((android.graphics.Color.alpha(icon.bgColor) * icon.fillOpacity).toInt() shl 24))
+            ((android.graphics.Color.alpha(icon.bgColor) * icon.fillOpacity).toInt() shl 24),
+            // the apps poking past the plate, from the icon into the card's coordinates: the icon (srcSize) is the
+            // card's shorter side over plateScale, centred on the card (see startScale)
+            icon.appShapes().apply {
+                val k = minOf(tray.width(), tray.height()) / (srcSize * icon.plateScale)
+                transform(android.graphics.Matrix().apply {
+                    setTranslate(-srcSize / 2f, -srcSize / 2f); postScale(k, k); postTranslate(tray.width() / 2f, tray.height() / 2f)
+                })
+            })
 
         // folder container bitmap that scales with the panel
         val bgCopy = FolderBgCopy(context, icon)
@@ -542,6 +550,9 @@ class FolderController(
             // the icon's plate (smaller when its apps poke out)
             val s = src.plateScale
             if (s != 1f) path.transform(android.graphics.Matrix().apply { setScale(s, s, w / 2f, h / 2f) })
+            // and the apps poking past it, as the icon's outline has them (so the close lands on the icon's shape)
+            val k = w / src.iconSizePx().toFloat()
+            path.op(src.appShapes().apply { transform(android.graphics.Matrix().apply { setScale(k, k) }) }, android.graphics.Path.Op.UNION)
         }
         fun moved() { if (glass != null) invalidate() }
         override fun onDraw(canvas: Canvas) {
@@ -713,6 +724,11 @@ class FolderPanel(
     private val revealRect = RectF()
     private val revealPath = android.graphics.Path()
     private val revealShape = android.graphics.Path()
+    /** The folder icon's apps where they poke past its plate, in card coordinates ([prepareReveal]). */
+    private val revealApps = android.graphics.Path()
+    private val revealAppsNow = android.graphics.Path()
+    /** The poking-out apps have sunk into the card this far into the reveal. */
+    private val APPS_GONE = 0.15f
     /** The folder icon's colour over the card while it's still icon-sized (Original style). */
     private var iconTint: View? = null
 
@@ -723,8 +739,9 @@ class FolderPanel(
      * The outline starts as the icon's own squircle plate and eases into the card's rounded rectangle: a rounded
      * rectangle all the way snapped to the squircle's rounder corners on the last frame.
      */
-    fun prepareReveal(iconColor: Int) {
+    fun prepareReveal(iconColor: Int, apps: android.graphics.Path) {
         val c = card ?: return
+        revealApps.set(apps)
         val w = c.width.toFloat()
         val h = c.height.toFloat()
         val side = minOf(w, h)
@@ -759,6 +776,14 @@ class FolderPanel(
                         com.oneuiclone.home.icons.IconShape.path(revealShape, revealRect.centerX(), revealRect.centerY(), size, shape)
                         revealPath.op(revealShape, android.graphics.Path.Op.INTERSECT)
                     }
+                }
+                // the apps poking past the icon's plate (Pixel, Outside): there at the icon, sinking into the card
+                // (scaled in about its centre, where they're inside its plate) by APPS_GONE
+                if (!revealApps.isEmpty && f < APPS_GONE) {
+                    val g = (f / APPS_GONE).let { it * it * (3f - 2f * it) }
+                    val s = 1f - 0.6f * g
+                    revealApps.transform(android.graphics.Matrix().apply { setScale(s, s, view.width / 2f, view.height / 2f) }, revealAppsNow)
+                    revealPath.op(revealAppsNow, android.graphics.Path.Op.UNION)
                 }
                 outline.setPath(revealPath)
                 // the icon casts no shadow: the card's fades with the reveal (out over the last stretch of a close,
