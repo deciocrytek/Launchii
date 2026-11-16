@@ -1554,8 +1554,10 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
      * whole GPU context) or killed, so the first frame back rebuilt everything: 440–780 ms on the emulator, more on
      * the Go phone. The close was over by then, Home showed separately afterwards (the "blank screen" between the app
      * and Home), and on a cold start the contract reply was too late to land the window on its icon.
-     * So the first frame back is drawn empty (the wallpaper the close shows anyway), which is quick; Home's content
-     * follows on the next frame while the close is still running. There's no landing surface (see [handleContract]).
+     * So the first frame back is quick: a picture of Home taken when it was stopped ([returnPicture]), or empty (the
+     * wallpaper the close shows anyway) without one. Home's views follow on the next frame while the close is still
+     * running, and until that slow frame is in, the picture stands in for them. There's no landing surface (see
+     * [handleContract]).
      * Only where returns are slow: a low-RAM (Go) phone, or one whose full first frame back took over
      * [SLOW_RETURN_MS] three times running. The Pixel's first frame is quick, and its close is left exactly as it was.
      */
@@ -1569,10 +1571,22 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
     private var returnFrameAt = 0L
     /** This Launcher has drawn a frame (a new one after the process was killed hasn't). */
     private var drawnOnce = false
+    /**
+     * Home's layer as the way back will show it (closed folder, Home screen, at rest inside the layer), drawn when Home
+     * was stopped with a close armed. A hardware bitmap: its pixels live in a graphics buffer, not in the renderer's
+     * GPU context, so the trim that empties that context leaves it alone, and drawing it costs no upload.
+     */
+    private var returnPicture: android.graphics.Bitmap? = null
+    /** Drawn by [RootLayout] in place of all of Home's views while the first frame back is up. */
+    private var pictureFrame: android.graphics.Bitmap? = null
+    private val picturePaint = android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG)
+    /** Bumped whenever a picture being drawn is no longer wanted. */
+    private var pictureGen = 0
+    private val pictureThread = java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "home-picture") }
 
     private fun lightReturns() = lowRam || slowReturns
 
-    /** The first frame back from an app: drawn empty where returns are slow, timed everywhere. */
+    /** The first frame back from an app: a picture of Home (or empty) where returns are slow, timed everywhere. */
     private fun returningToHome(why: String) {
         if (lightFrame) return
         val now = android.os.SystemClock.uptimeMillis()
@@ -1581,10 +1595,15 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             return
         }
         lightFrame = true
-        root.visibility = View.INVISIBLE
+        val pic = returnPicture?.takeIf { !it.isRecycled && it.width == homeLayer.width && it.height == homeLayer.height }
+        if (pic != null) returnPicture = null
+        dropReturnPicture()   // (a picture still being drawn is too late for this frame)
+        if (pic != null) { pictureFrame = pic; root.invalidate() } else root.visibility = View.INVISIBLE
         root.removeCallbacks(lightFrameCap)
         root.postDelayed(lightFrameCap, LIGHT_FRAME_MAX_MS)
-        AnimLog.log("light first frame ($why)")
+        val what = "light first frame ($why): ${if (pic != null) "Home's picture" else "empty"}"
+        AnimLog.log(what)
+        android.util.Log.i("OneUiHome", what)
         afterNextCommit { endLightFrame("drawn") }
     }
 
@@ -1593,9 +1612,84 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         lightFrame = false
         root.removeCallbacks(lightFrameCap)
         root.visibility = View.VISIBLE
+        pictureFrame?.let { pic ->
+            pictureFrame = null
+            root.invalidate()
+            // on screen until the next frame replaces it
+            afterNextCommit { pic.recycle() }
+        }
         AnimLog.log("light frame over ($source): Home's content draws")
+        android.util.Log.i("OneUiHome", "light frame over ($source)")
         returnFrameAt = android.os.SystemClock.uptimeMillis()
         afterNextCommit { timeReturnFrame() }
+    }
+
+    /**
+     * Draws [returnPicture] from Home's layer as it stands (stopped with the close armed: Home screen, folders closed,
+     * at the open scale, which the layer's own transform holds). The views are recorded into a Picture, which the GPU
+     * renders while its context is still up (widgets can hold hardware bitmaps, which a software canvas can't draw).
+     * View effects (RenderEffect) aren't part of a Picture: a glass-keyed widget shows its own background for that
+     * one frame.
+     */
+    private fun takeReturnPicture() {
+        dropReturnPicture()
+        val v = homeLayer
+        if (v.width == 0 || v.height == 0) return
+        val t0 = android.os.SystemClock.uptimeMillis()
+        val w = v.width; val h = v.height
+        val gen = pictureGen
+        // drawn as Home will settle: glass plates sample the wallpaper where they sit on screen, so at the open
+        // scale they'd pick up the wrong part of it (darker dock plates that lighten when the views take over)
+        val sx = v.scaleX; val sy = v.scaleY
+        v.scaleX = 1f; v.scaleY = 1f
+        val pic = try {
+            android.graphics.Picture().also { p -> v.draw(p.beginRecording(w, h)); p.endRecording() }
+        } catch (e: Exception) {
+            android.util.Log.w("OneUiHome", "Home picture failed", e)
+            null
+        } finally {
+            v.scaleX = sx; v.scaleY = sy
+        } ?: return
+        val recorded = android.os.SystemClock.uptimeMillis() - t0
+        // the GPU render (up to 300 ms on the emulator) off the main thread, so a quick way back isn't held up by it
+        pictureThread.execute {
+            val bmp = try {
+                android.graphics.Bitmap.createBitmap(pic, w, h, android.graphics.Bitmap.Config.HARDWARE)
+            } catch (e: Exception) {
+                android.util.Log.w("OneUiHome", "Home picture failed", e)
+                null
+            }
+            val ms = android.os.SystemClock.uptimeMillis() - t0
+            root.post {
+                // a way back already under way (or Home stopped again) has moved on: this one is too late
+                if (bmp == null || gen != pictureGen) { bmp?.recycle(); return@post }
+                returnPicture = bmp
+                val what = "Home's picture for the way back: recorded $recorded ms, ready $ms ms"
+                AnimLog.log(what)
+                android.util.Log.i("OneUiHome", what)
+            }
+        }
+    }
+
+    /** No [returnPicture], and none still being drawn will be kept. */
+    private fun dropReturnPicture() {
+        pictureGen++
+        returnPicture?.recycle()
+        returnPicture = null
+    }
+
+    /** [pictureFrame] where Home's layer is, with its transform; the wallpaper copy only while it covers a button close. */
+    private fun drawPictureFrame(canvas: android.graphics.Canvas, pic: android.graphics.Bitmap, drawChild: (View) -> Unit) {
+        if (wallpaper.cover) drawChild(wallpaper)
+        drawChild(scrim)
+        val v = homeLayer
+        if (v.visibility != View.VISIBLE || v.alpha <= 0f) return
+        canvas.save()
+        canvas.translate(v.left.toFloat(), v.top.toFloat())
+        canvas.concat(v.matrix)
+        picturePaint.alpha = (v.alpha * 255).toInt().coerceIn(0, 255)
+        canvas.drawBitmap(pic, 0f, 0f, picturePaint)
+        canvas.restore()
     }
 
     /** Home's first full frame back is in: remember whether returns on this phone are slow. */
@@ -2377,6 +2471,9 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             if (com.oneuiclone.home.ui.LiveWallpaper.drives) com.oneuiclone.home.ui.LiveWallpaper.park(wallpaperOpenZoom)
             homeCovered = true
         }
+        // where returns are slow, the first frame back shows Home as it is now (see [returningToHome])
+        if (homeCovered && lightReturns()) takeReturnPicture()
+        else dropReturnPicture()
     }
 
     /** Home's window hidden behind an app (or Home stopped): the open's card and effect go, out of sight. */
@@ -3327,6 +3424,13 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
             super.onSizeChanged(w, h, oldw, oldh)
             if (w > 0 && h > 0 && (w != oldw || h != oldh)) post { setupProfile(w, h) }
+        }
+
+        override fun dispatchDraw(canvas: android.graphics.Canvas) {
+            val pic = pictureFrame
+            if (pic == null) { super.dispatchDraw(canvas); return }
+            val t = drawingTime
+            drawPictureFrame(canvas, pic) { drawChild(canvas, it, t) }
         }
 
         override fun onInterceptTouchEvent(ev: MotionEvent): Boolean =

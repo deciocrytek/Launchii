@@ -142,6 +142,21 @@ class AppsSearch(
     private val web = LinearLayout(context)
     /** The answers row (0.230): a sum, a settings page or the Play Store, between the apps and Google. */
     private val answerBox = LinearLayout(context)
+    /**
+     * The contact "go" opens, as a row right above the bar (0.258): typing "erica" with no app match, Enter opened
+     * Erica's chip at the very top while the Play Store row sat by the bar and looked like the target. Her chip stays
+     * up top and is highlighted too ([enterTwin]).
+     */
+    private val contactRowBox = LinearLayout(context)
+    private var shownContactRow: Long? = null
+    /** The chip of the contact in [contactRowBox], highlighted along with it. */
+    private var enterTwin: View? = null
+    /**
+     * Every contact found while typing in this search. Gboard's autocorrect on Enter replaces "erica" with "Erica" by
+     * way of an empty field, which dropped the typed contacts back to the suggestions: the row went and "go" opened
+     * the Play Store instead. The contacts are filtered from these as well until the new query answers.
+     */
+    private val seenContacts = LinkedHashMap<Long, SearchSources.Contact>()
     private val content = LinearLayout(context)
     /** The snapshot this search opened with. */
     private var scores: Map<AppKey, Double> = emptyMap()
@@ -439,7 +454,7 @@ class AppsSearch(
         content.orientation = LinearLayout.VERTICAL
         content.gravity = Gravity.BOTTOM
         content.clipChildren = false
-        for (box in listOf(contactsBox, web, answerBox)) {
+        for (box in listOf(contactsBox, web, answerBox, contactRowBox)) {
             box.orientation = LinearLayout.VERTICAL
             box.clipChildren = false
             content.addView(box, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -509,7 +524,7 @@ class AppsSearch(
         val raw = q.trim()
         answer = findAnswer(raw, query, appsList)
         webList = listOf(raw) + webList.drop(1).filter { it.startsWith(raw, ignoreCase = true) && !it.equals(raw, ignoreCase = true) }
-        contactsList = contactsList.filter { c -> normalize(c.name).split(' ', '-', '.').any { it.startsWith(query) } }.take(SearchSources.MAX_MATCHES)
+        contactsList = (contactsList + seenContacts.values).distinctBy { it.id }.filter { c -> normalize(c.name).split(' ', '-', '.').any { it.startsWith(query) } }.take(SearchSources.MAX_MATCHES)
         render()
         fetchSuggestions(raw)
         querySources(raw)
@@ -566,9 +581,14 @@ class AppsSearch(
             showContacts(if (invite) emptyList() else contactsList.take(rows * 2), invite && rows > 0, chip)
             showWeb(emptyList())
             showAnswer(null)
+            showContactRow(null)
         } else {
             showAnswer(answer)
-            val room = left - if (answer != null) dp.dpi(ANSWER_DP) + 2 * dp.dpi(CARD_PAD_DP) + gap else 0
+            // "go" opens the first contact when no app matched and there's no sum or settings answer: it gets a row
+            val pick = contactsList.firstOrNull()?.takeIf { !invite && appsList.isEmpty() && (answer?.id?.startsWith("play|") ?: true) }
+            showContactRow(pick)
+            val card = dp.dpi(ANSWER_DP) + 2 * dp.dpi(CARD_PAD_DP) + gap
+            val room = left - (if (answer != null) card else 0) - (if (pick != null) card else 0)
             val chip = dp.dpi(CHIP_DP)
             fun height(rows: Int) = if (rows == 0) 0 else rows * chip + (rows - 1) * chipGap + gap
             fun webFits(h: Int) = ((h - gap - 2 * dp.dpi(CARD_PAD_DP)) / dp.dpi(ROW_DP)).coerceIn(0, MAX_WEB)
@@ -746,6 +766,50 @@ class AppsSearch(
         reveal(card)
     }
 
+    /** [c]'s row above the bar, in the answer row's card, rebuilt (and faded in) only when the contact changes. */
+    private fun showContactRow(c: SearchSources.Contact?) {
+        if (c?.id == shownContactRow) return
+        shownContactRow = c?.id
+        contactRowBox.removeAllViews()
+        contactRowBox.visibility = if (c == null) GONE else VISIBLE
+        if (c == null) return
+        val card = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply { cornerRadius = dp.dp(26f); setColor(0x1FFFFFFF) }
+            setPadding(0, dp.dpi(CARD_PAD_DP), 0, dp.dpi(CARD_PAD_DP))
+            clipToOutline = true
+        }
+        val r = row(ContactAvatar(context, c.photo, c.name, avatarColor(c.name)), 36f, c.name, "Contact", true) {
+            sources.contactOpened(c)
+            onOpenIntent(it, Intent(Intent.ACTION_VIEW, c.uri))
+        } as LinearLayout
+        r.addView(GoBadge(context), LinearLayout.LayoutParams(dp.dpi(30f), dp.dpi(30f)).apply { leftMargin = dp.dpi(12f); rightMargin = dp.dpi(6f) })
+        card.addView(r, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp.dpi(ANSWER_DP)))
+        contactRowBox.addView(card)
+        reveal(card)
+    }
+
+    /** The small → at the end of the contact row: the keyboard's "go" key, so it reads as what Enter opens. */
+    private class GoBadge(context: Context) : View(context) {
+        private val fill = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply { color = 0x38FFFFFF }
+        private val ink = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFFFFFFFF.toInt(); style = android.graphics.Paint.Style.STROKE
+            strokeCap = android.graphics.Paint.Cap.ROUND; strokeJoin = android.graphics.Paint.Join.ROUND
+        }
+        private val path = android.graphics.Path()
+        override fun onDraw(canvas: android.graphics.Canvas) {
+            val s = width.coerceAtMost(height).toFloat()
+            val cx = width / 2f; val cy = height / 2f
+            canvas.drawCircle(cx, cy, s / 2f, fill)
+            ink.strokeWidth = s * 0.075f
+            val a = s * 0.23f; val head = s * 0.17f
+            path.reset()
+            path.moveTo(cx - a, cy); path.lineTo(cx + a, cy)
+            path.moveTo(cx + a - head, cy - head); path.lineTo(cx + a, cy); path.lineTo(cx + a - head, cy + head)
+            canvas.drawPath(path, ink)
+        }
+    }
+
     // ---------------------------------------------------------------------------------------------
     // contacts
     // ---------------------------------------------------------------------------------------------
@@ -757,6 +821,7 @@ class AppsSearch(
             sources.query(raw) { ct ->
                 if (!isOpen || field.text.toString().trim() != raw) return@query
                 contactsList = ct
+                ct.forEach { seenContacts[it.id] = it }
                 render()
             }
         }
@@ -809,7 +874,7 @@ class AppsSearch(
     /** Height, corners and avatar for a chip [h] px tall (suggestions stretch to fill the space). */
     private fun sizeChip(c: View, h: Int) {
         (c.layoutParams as? LinearLayout.LayoutParams)?.let { if (it.height != h) { it.height = h; c.layoutParams = it } }
-        if (c !== enterTarget) c.background = chipBackground(h)
+        if (c !== enterTarget && c !== enterTwin) c.background = chipBackground(h)
         val avatar = (c as ViewGroup).getChildAt(0)
         val size = (h - dp.dpi(12f)).coerceIn(dp.dpi(32f), dp.dpi(40f))
         avatar.layoutParams = avatar.layoutParams.apply { width = size; height = size }
@@ -916,13 +981,27 @@ class AppsSearch(
         val playAnswer = shownAnswer?.startsWith("play|") == true
         val target = if (field.text.isNullOrBlank()) null
             else (results.getChildAt(0) as? IconView)
+                ?: firstEnterable(contactRowBox)
                 ?: (if (playAnswer) firstEnterable(contactsBox) ?: firstEnterable(answerBox)
                     else firstEnterable(answerBox) ?: firstEnterable(contactsBox))
                 ?: firstEnterable(web)
+        // the contact row's chip up top is highlighted with it (rebuilt chips need it again even when the row stays)
+        val twin = if (target != null && contactRowBox.visibility == VISIBLE && target === firstEnterable(contactRowBox))
+            firstEnterable(contactsBox) else null
+        if (twin !== enterTwin) {
+            enterTwin?.background = chipBackground(shownChipHeight)
+            enterTwin = twin
+            twin?.let { highlight(it) }
+        }
         if (target === enterTarget) return
         enterTarget?.let { it.background = when { it is IconView -> null; it.tag == CHIP -> chipBackground(shownChipHeight); else -> rowRipple() } }
         enterTarget = target
         if (target == null) return
+        highlight(target)
+    }
+
+    /** Pixel's "go" highlight: a light fill under an icon, a chip or a row. */
+    private fun highlight(target: View) {
         val mark = GradientDrawable().apply {
             setColor(0x33FFFFFF)
             cornerRadius = if (target is IconView) dp.dp(22f) else if (target.tag == CHIP) shownChipHeight / 2f else dp.dp(18f)

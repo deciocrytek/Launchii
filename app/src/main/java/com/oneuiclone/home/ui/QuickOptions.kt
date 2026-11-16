@@ -208,7 +208,22 @@ class QuickOptionPopup(
         val topMin = dp.dp(38f) + dp.insets.top                                  // quick_option_top_minimum_margin
         var y = anchor.top - gap - h
         val above = y >= topMin
-        if (!above) y = anchor.bottom + gap + dp.labelTextSizePx * 1.6f
+        var squeezed = false
+        if (!above) {
+            y = anchor.bottom + gap + dp.labelTextSizePx * 1.6f
+            // With the keyboard up (search results) the room below ends at its top edge. If the card fits on
+            // neither side of the icon, it goes in the bigger gap, clamped on screen (it may cover part of the icon).
+            val ime = rootWindowInsets?.getInsets(android.view.WindowInsets.Type.ime())?.bottom ?: 0
+            if (ime > 0) {
+                val bottomMax = dp.heightPx - ime - gap
+                if (y + h > bottomMax) {
+                    squeezed = true
+                    val roomAbove = anchor.top - gap - topMin
+                    val roomBelow = bottomMax - (anchor.bottom + gap)
+                    y = if (roomAbove >= roomBelow) topMin else (bottomMax - h).coerceAtLeast(topMin)
+                }
+            }
+        }
         val x = (anchor.exactCenterX() - w / 2f).coerceIn(margin, dp.widthPx - margin - w)
         card.x = x; card.y = y
         backdrop?.invoke(Rect(x.toInt(), y.toInt(), (x + w).toInt(), (y + h).toInt())) {
@@ -218,7 +233,7 @@ class QuickOptionPopup(
             backdropView.tint = blurTint
         }
         card.pivotX = (anchor.exactCenterX() - x).coerceIn(0f, w.toFloat())
-        card.pivotY = if (above) h.toFloat() else 0f
+        card.pivotY = when { squeezed -> (anchor.exactCenterY() - y).coerceIn(0f, h.toFloat()); above -> h.toFloat(); else -> 0f }
         card.alpha = 0f; card.scaleX = 0.8f; card.scaleY = 0.8f
         shown = true
         AnimatorSet().apply {
