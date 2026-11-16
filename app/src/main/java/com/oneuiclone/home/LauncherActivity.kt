@@ -90,6 +90,7 @@ class LauncherActivity : Activity() {
     override fun onTopResumedActivityChanged(isTopResumedActivity: Boolean) {
         super.onTopResumedActivityChanged(isTopResumedActivity)
         AnimLog.log("top resumed=$isTopResumedActivity")
+        launcher.onTopResumedChanged(isTopResumedActivity)
     }
 
     /**

@@ -146,6 +146,8 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         /** Lift-Off: let go past 30% and it opens, unless heading back faster than 0.0015 progress/ms; a flick
          *  toward it faster than 0.0012/ms (~340 dp/s) opens from anywhere. The spring is critically damped. */
         private const val LIFT_COMMIT = 0.3f
+        /** How long Home may stay resumed after losing the top spot before that counts as the nav-bar swipe up. */
+        private const val NAV_SWIPE_CHECK_MS = 120L
         private const val LIFT_FLICK = 0.0012f
         private const val LIFT_BACK_FLICK = 0.0015f
         private const val LIFT_STIFFNESS = 420f
@@ -2299,7 +2301,30 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         v.pivotY = v.height / 2f
     }
 
+    /**
+     * Search follows a swipe up on the nav bar from its start, as it does a swipe down: the system's gesture takes
+     * the top spot from Home (about 100 ms in) but leaves it resumed, its window shown live in the gesture's card,
+     * until the home intent at the very end. Anything else that takes the top spot (a permission dialog, an app)
+     * pauses Home at once.
+     */
+    private val navSwipeOverSearch = Runnable {
+        if (homeResumed && !homeTopResumed && search?.isOpen == true) {
+            AnimLog.log("nav-bar swipe over search: back to Home")
+            closeSearch(toHome = true)
+        }
+    }
+    private var homeResumed = false
+    private var homeTopResumed = false
+
+    fun onTopResumedChanged(top: Boolean) {
+        homeTopResumed = top
+        root.removeCallbacks(navSwipeOverSearch)
+        if (!top && homeResumed && search?.isOpen == true) root.postDelayed(navSwipeOverSearch, NAV_SWIPE_CHECK_MS)
+    }
+
     fun onPause() {
+        homeResumed = false
+        root.removeCallbacks(navSwipeOverSearch)
         leftHomeAt = System.currentTimeMillis()
         BadgeService.removeListener(badgeListener)
     }
@@ -2401,6 +2426,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
     }
 
     fun onResume() {
+        homeResumed = true
         stoppedSinceResume = false
         AppUpdate.onResumed(activity)
         AppUpdate.checkIfDue()
@@ -2576,9 +2602,13 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         resizeFrame?.dismiss()
         drag.cancel()
         quickOpen?.close(animate = alreadyOnHome)
-        if (alreadyOnHome) {
+        // A swipe up on the nav bar over search: the system's swipe-up gesture holds the window focus while it runs,
+        // so anything but a quick flick arrives as not "already on Home". Home was still in front if no app stopped it.
+        if (search?.isOpen == true && (alreadyOnHome || !stoppedSinceResume)) {
+            AnimLog.log("home intent over search: back to Home")
+            closeSearch(toHome = true)
+        } else if (alreadyOnHome) {
             when {
-                search?.isOpen == true -> closeSearch(toHome = true)
                 edit.isActive -> edit.exit()
                 folders.isOpen -> folders.close()
                 state.state == StateController.State.APPS -> state.goTo(StateController.State.HOME)
