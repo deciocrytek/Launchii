@@ -114,7 +114,7 @@ class StylePreview(private val activity: Activity) {
     @Volatile private var loaded: Loaded? = null
     /** Goes up each time [load] reads Home and the wallpapers again, so strips made before are known to be stale. */
     var version = 0; private set
-    private var widgetShots: Map<Int, Bitmap> = emptyMap()
+    private var widgetCaptures: Map<Int, com.oneuiclone.home.widgets.WidgetManager.WidgetCapture> = emptyMap()
     private var generation = 0
     /** Icons last made, and for which size and look, so a label-only change reuses them. */
     private var icons: Map<AppKey, Bitmap> = emptyMap()
@@ -132,8 +132,8 @@ class StylePreview(private val activity: Activity) {
                 loaded = l
                 version++
                 iconsFor = null
-                widgetShots = Launcher.live?.get()?.let { home ->
-                    l.items.filterIsInstance<HomeItem.Widget>().mapNotNull { w -> home.widgetSnapshot(w.appWidgetId)?.let { w.appWidgetId to it } }.toMap()
+                widgetCaptures = Launcher.live?.get()?.let { home ->
+                    l.items.filterIsInstance<HomeItem.Widget>().mapNotNull { w -> home.widgetCapture(w.appWidgetId)?.let { w.appWidgetId to it } }.toMap()
                 } ?: emptyMap()
                 glass.rebuild(l.home ?: gradient(l.homeColors))
                 done()
@@ -214,6 +214,39 @@ class StylePreview(private val activity: Activity) {
      */
     fun homeView(look: Look, bright: Boolean, done: (View) -> Unit) =
         withIcons(look) { l, dp, made -> done(buildHome(l, dp, look, made, bright)) }
+
+    /**
+     * What the App opening animation page plays (0.262): the wallpaper (display-sized), Home's first page on a clear
+     * background at [scale] of the display, and the app it opens: a dock app near the middle (else any app on the
+     * page), its icon and where that sits on the display.
+     */
+    class OpenScene(val wallpaper: Bitmap, val home: Bitmap, val scale: Float, val key: AppKey, val label: String,
+                    val icon: Bitmap, val iconRect: android.graphics.RectF, val width: Int, val height: Int)
+
+    fun openScene(look: Look, scale: Float, done: (OpenScene?) -> Unit) = withIcons(look) { l, dp, made ->
+        val root = buildHome(l, dp, look, made, bright(l))
+        val icons = ArrayList<IconView>()
+        fun walk(v: View) {
+            if (v is IconView && v !is FolderIconView && v.icon != null) icons += v
+            if (v is android.view.ViewGroup) for (i in 0 until v.childCount) walk(v.getChildAt(i))
+        }
+        walk(root)
+        val rects = icons.map { v ->
+            val r = Rect(v.iconLeft(), v.iconTop(), v.iconLeft() + v.iconSizePx(), v.iconTop() + v.iconSizePx())
+            root.offsetDescendantRectToMyCoords(v, r)
+            v to r
+        }
+        // the dock's middle app (lowest row, nearest the centre)
+        val pick = rects.maxWithOrNull(compareBy<Pair<IconView, Rect>> { it.second.top / (dp.cellHeight / 2) }
+            .thenBy { -kotlin.math.abs(it.second.centerX() - width / 2) })
+        val app = pick?.let { (v, _) -> made.entries.firstOrNull { it.value === v.icon } }
+        if (pick == null || app == null) { done(null); return@withIcons }
+        val wall = l.home ?: gradient(l.homeColors)
+        val home = Bitmap.createBitmap((width * scale).toInt(), (height * scale).toInt(), Bitmap.Config.ARGB_8888)
+        Canvas(home).apply { scale(scale, scale); root.draw(this) }
+        done(OpenScene(wall, home, scale, app.key, l.drawables[app.key]?.first ?: "", app.value,
+            android.graphics.RectF(pick.second), width, height))
+    }
 
     /** Frosted folders, plates and the search pill blur [full] (a display-sized wallpaper) from now on. */
     fun rebuildGlass(full: Bitmap) = glass.rebuild(full)
@@ -345,16 +378,29 @@ class StylePreview(private val activity: Activity) {
             }
             is HomeItem.Folder -> {
                 val content = l.folders[item.id].orEmpty().mapNotNull { k -> made[k]?.let { it to k } }
-                (if (item.large) LargeFolderIconView(activity, dp).apply { apps = content.map { it.first to it.second } }
-                    else FolderIconView(activity, dp).apply { previews = content.map { it.first } }).apply {
+                (if (item.large) LargeFolderIconView(activity, dp).apply {
+                    folderId = item.id
+                    apps = content.map { it.first to it.second }
+                    if (needsGlass(look)) plateGlass = this@StylePreview.glass
+                    hasCustomTint = item.color != 0
+                } else FolderIconView(activity, dp).apply { previews = content.map { it.first } }).apply {
                     label = item.title
-                    if (item.color != 0) bgColor = item.color
-                    val t = WidgetStyles.folderTransparency(activity, item.id)
-                    fillOpacity = if (t == null) 1f else 1f - t / 100f
-                    glass = if (t == null) null else this@StylePreview.glass
+                    val seeThrough = look.themed && !look.dark && (look.plateAlpha < 1f || look.look == IconFactory.LOOK_CLEAR_COLOUR)
+                    if (this !is LargeFolderIconView && item.color == 0 && seeThrough) {
+                        val acc = if (look.themeColor != 0) look.themeColor else IconFactory.themeAccent(activity)
+                        val ta = look.plateAlpha * (if (look.look == IconFactory.LOOK_CLEAR_COLOUR) (1f + IconFactory.CLEAR_VEIL_FOOT) / 2f else 1f)
+                        bgColor = (acc and 0x00FFFFFF) or ((ta.coerceIn(0f, 1f) * 255).toInt() shl 24)
+                        fillOpacity = 1f
+                        glass = this@StylePreview.glass
+                    } else {
+                        if (item.color != 0) bgColor = item.color
+                        val t = WidgetStyles.folderTransparency(activity, item.id)
+                        fillOpacity = if (t == null) 1f else 1f - t / 100f
+                        glass = if (this is LargeFolderIconView || t != null) this@StylePreview.glass else null
+                    }
                 }
             }
-            is HomeItem.Widget -> ShotView(activity, widgetShots[item.appWidgetId], dp.dp(20f))
+            is HomeItem.Widget -> ShotView(activity, widgetCaptures[item.appWidgetId], this@StylePreview.glass, dp.dp(20f))
         }
         for (item in l.items) {
             val v = itemView(item) ?: continue
@@ -430,7 +476,10 @@ class StylePreview(private val activity: Activity) {
      * of the wallpaper; each goes to [done] (main thread) as it's made. Glass looks get the wallpaper blurred under
      * their plates, as Home draws it.
      */
-    fun themeTiles(looks: List<Look>, w: Int, h: Int, done: (Int, Bitmap) -> Unit) {
+    fun themeTiles(looks: List<Look>, w: Int, h: Int, done: (Int, Bitmap) -> Unit) = themeTiles(looks, w, h, false, done)
+
+    /** [themeTiles] on a clear background when [clear] (the Settings hub's Icons tile, which has the wallpaper under it). */
+    fun themeTiles(looks: List<Look>, w: Int, h: Int, clear: Boolean, done: (Int, Bitmap) -> Unit) {
         val l = loaded ?: return
         val apps = (l.items.filter { it.container == Container.HOTSEAT }.sortedBy { it.x } +
             l.items.filter { it.container == Container.WORKSPACE }.sortedWith(compareBy({ it.y }, { it.x })))
@@ -468,7 +517,7 @@ class StylePreview(private val activity: Activity) {
             for ((i, look) in looks.withIndex()) {
                 if (io.isShutdown) return@execute
                 iconFactory.ownColour = look.themeColor
-                val out = patch.copy(Bitmap.Config.ARGB_8888, true)
+                val out = if (clear) Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888) else patch.copy(Bitmap.Config.ARGB_8888, true)
                 val c = Canvas(out)
                 for ((j, k) in apps.withIndex()) {
                     val d = l.drawables[k]?.second ?: continue
@@ -489,6 +538,14 @@ class StylePreview(private val activity: Activity) {
             }
         }
     }
+
+    /** Home's wallpaper as the previews draw it (the colours' gradient for one Launchii can't read), once [load] has run. */
+    fun wallpaper(): Bitmap? {
+        val l = loaded ?: return null
+        return l.home ?: wallGradient?.takeIf { wallGradientFor === l } ?: gradient(l.homeColors).also { wallGradient = it; wallGradientFor = l }
+    }
+    private var wallGradient: Bitmap? = null
+    private var wallGradientFor: Any? = null
 
     /** Looks whose plates show the blurred wallpaper through them (Frosted, Stencil, Clear Colour), as Home draws them. */
     private fun needsGlass(look: Look) = look.themed && (look.plateAlpha < 1f || look.look in IconFactory.GLASS_LOOKS)
@@ -533,12 +590,57 @@ class StylePreview(private val activity: Activity) {
         glass.destroy()
     }
 
-    /** A widget as Home drew it; a soft card where it couldn't be copied. */
-    private class ShotView(context: android.content.Context, private val shot: Bitmap?, private val radius: Float) : View(context) {
-        private val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply { if (shot == null) color = 0x33FFFFFF }
+    /** A widget captured from Home that re-frosts live against [glass]; a soft card where it couldn't be copied. */
+    private class ShotView(
+        context: android.content.Context,
+        private val capture: com.oneuiclone.home.widgets.WidgetManager.WidgetCapture?,
+        private val glass: WidgetGlass,
+        private val radius: Float,
+    ) : View(context) {
+        private val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply { if (capture == null) color = 0x33FFFFFF }
+        private val toWindow = Matrix()
+        private val drawnAt = Matrix()
+        private val moved = android.view.ViewTreeObserver.OnPreDrawListener {
+            if (capture?.hasGlass == true) {
+                toWindow.reset(); transformMatrixToGlobal(toWindow)
+                if (toWindow != drawnAt) invalidate()
+            }
+            true
+        }
+
+        override fun onAttachedToWindow() {
+            super.onAttachedToWindow()
+            if (capture?.hasGlass == true) {
+                glass.views.add(this)
+                viewTreeObserver.addOnPreDrawListener(moved)
+            }
+        }
+
+        override fun onDetachedFromWindow() {
+            if (capture?.hasGlass == true) {
+                viewTreeObserver.removeOnPreDrawListener(moved)
+                glass.views.remove(this)
+            }
+            super.onDetachedFromWindow()
+        }
+
         override fun onDraw(canvas: Canvas) {
-            if (shot != null) canvas.drawBitmap(shot, null, Rect(0, 0, width, height), paint)
-            else canvas.drawRoundRect(width * 0.04f, height * 0.04f, width * 0.96f, height * 0.96f, radius, radius, paint)
+            val cap = capture
+            if (cap == null) {
+                canvas.drawRoundRect(width * 0.04f, height * 0.04f, width * 0.96f, height * 0.96f, radius, radius, paint)
+                return
+            }
+            val p = cap.pad
+            val innerW = (width - 2 * p).coerceAtLeast(1)
+            val innerH = (height - 2 * p).coerceAtLeast(1)
+            val dx = p.toFloat()
+            val dy = (p - cap.lift).toFloat()
+            drawnAt.reset(); transformMatrixToGlobal(drawnAt)
+            toWindow.set(drawnAt); toWindow.preTranslate(dx, dy)
+            canvas.save()
+            canvas.translate(dx, dy)
+            cap.draw(canvas, innerW, innerH, glass, toWindow)
+            canvas.restore()
         }
     }
 }

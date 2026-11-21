@@ -81,6 +81,8 @@ class WallpaperActivity : Activity() {
     private val look by lazy { StylePreview.Look.of(Prefs(this)) }
     /** Home's labels and dots are dark ([StylePreview.homeView]): the photo as framed takes dark text. */
     private var bright: Boolean? = null
+    /** Estimated Material You accent for the currently framed photo (0 = keep saved themeColor). */
+    private var previewAccent = 0
     private var sheet: Sheet? = null
     private var busy = false
 
@@ -222,21 +224,29 @@ class WallpaperActivity : Activity() {
     }
 
     /**
-     * Frosted plates, folders and the search pill blur the photo as framed now, and labels turn dark on a light
-     * part (Home goes by the colours of the wallpaper as set); Home is rebuilt only when that changes.
+     * Frosted plates, folders, widgets and the search pill blur the photo as framed now; labels turn dark on a light
+     * part and palette-tinted icons preview the new photo's Material You accent. Home is rebuilt only when brightness
+     * or the estimated accent changes noticeably.
      */
     private fun refreshHome() {
         val p = preview ?: return
         if (crop.bitmap == null || isDestroyed) return
         val full = crop.render(p.width, p.height)
         p.rebuildGlass(full)
+        val wantPalette = look.themeColor == 0 && com.oneuiclone.home.icons.IconFactory.usesPalette(look.themed, look.dark, look.minimal, look.look)
         io.execute {
             val small = Bitmap.createScaledBitmap(full, max(1, full.width / 8), max(1, full.height / 8), true)
-            val light = (WallpaperColors.fromBitmap(small).colorHints and WallpaperColors.HINT_SUPPORTS_DARK_TEXT) != 0
+            val wc = WallpaperColors.fromBitmap(small)
+            val light = (wc.colorHints and WallpaperColors.HINT_SUPPORTS_DARK_TEXT) != 0
+            val est = if (wantPalette) com.oneuiclone.home.icons.IconFactory.estimateAccent(wc) else 0
             runOnUiThread {
-                if (isDestroyed || light == bright) return@runOnUiThread
+                if (isDestroyed) return@runOnUiThread
+                val accentChanged = wantPalette && (previewAccent == 0 || !com.oneuiclone.home.icons.IconFactory.accentSimilar(est, previewAccent))
+                if (bright != null && light == bright && !accentChanged) return@runOnUiThread
                 bright = light
-                p.homeView(look, light) { v ->
+                if (accentChanged) previewAccent = est
+                val effective = if (wantPalette && previewAccent != 0) look.copy(themeColor = previewAccent) else look
+                p.homeView(effective, light) { v ->
                     homeLayer.removeAllViews()
                     homeLayer.addView(v, FrameLayout.LayoutParams(p.width, p.height))
                     if (homeToggle.visibility != View.VISIBLE) {
@@ -306,6 +316,10 @@ class WallpaperActivity : Activity() {
                 else {
                     WallpaperLayer.recordOwnCopy(this, out) { WallpaperManager.getInstance(this).getWallpaperId(WallpaperManager.FLAG_SYSTEM) }
                     if (which and WallpaperManager.FLAG_LOCK != 0) WallpaperLayer.setDisplayBitmap(this, out, WallpaperManager.FLAG_LOCK)
+                }
+                // Home's hold menu offers the last few back (lock-only sets don't count)
+                try { com.oneuiclone.home.ui.WallpaperHistory.add(this, out, which) } catch (e: Exception) {
+                    android.util.Log.w("OneUiHome", "wallpaper history: add failed", e)
                 }
                 true
             } catch (e: Exception) {

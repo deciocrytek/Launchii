@@ -116,6 +116,31 @@ object WallpaperBlur {
         return Result.DONE
     }
 
+    /**
+     * Sets [sharp] (display-sized) as the wallpaper on [which] in one change, Home's blurred at [level] when that's
+     * above 0, with the sharp original kept as a blur run keeps it (a recent wallpaper picked from Home's menu).
+     */
+    fun setPicture(context: Context, sharp: Bitmap, which: Int, level: Float) = synchronized(lock) {
+        val wm = WallpaperManager.getInstance(context)
+        if (which and WallpaperManager.FLAG_LOCK != 0) {
+            wm.setBitmap(sharp, null, true, WallpaperManager.FLAG_LOCK)
+            WallpaperLayer.recordLockCopy(context, sharp)
+        }
+        if (which and WallpaperManager.FLAG_SYSTEM == 0) return@synchronized
+        val prefs = context.getSharedPreferences(WallpaperLayer.PREFS, Context.MODE_PRIVATE)
+        if (level <= 0f) {
+            setHome(context, sharp)
+            prefs.edit().remove(KEY_BLURRED_ID).remove(KEY_BLURRED_STAMP).remove(KEY_LEVEL).commit()
+            return@synchronized
+        }
+        File(context.filesDir, SHARP_FILE).outputStream().use { sharp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        val shared = wm.getWallpaperId(WallpaperManager.FLAG_LOCK) <= 0
+        val id = setHome(context, blur(sharp, level))
+        if (shared) WallpaperLayer.recordLockCopy(context, sharp)
+        prefs.edit().putInt(KEY_BLURRED_ID, id).putLong(KEY_BLURRED_STAMP, prefs.getLong(WallpaperLayer.KEY_COPY_STAMP, 0L))
+            .putFloat(KEY_LEVEL, level).commit()
+    }
+
     /** The current Home wallpaper at display size: the launcher's own copy (a wallpaper set elsewhere can't be read). */
     private fun readCurrent(context: Context, prefs: android.content.SharedPreferences, current: Int): Bitmap? {
         val own = File(context.filesDir, WallpaperLayer.OWN_FILE)

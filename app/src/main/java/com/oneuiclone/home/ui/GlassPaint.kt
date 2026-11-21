@@ -17,9 +17,77 @@ class GlassPaint {
 
     /** Points [paint] at [glass] for a canvas mapped to the window by [toWindow]; false when there's nothing to draw. */
     fun aim(glass: WidgetGlass?, toWindow: Matrix): Boolean {
-        val b = glass?.bitmap ?: return false
+        if (glass == null) return false
+        return if (overrideActive) aimBitmap(overrideBitmap, overrideScale, toWindow)
+        else aimBitmap(glass.bitmap, glass.scale, toWindow)
+    }
+
+    /** Points [paint] at [glass]'s lighter optical crystal blur (falling back to the standard glass). */
+    fun aimCrystal(glass: WidgetGlass?, toWindow: Matrix): Boolean {
+        if (glass == null) return false
+        if (overrideActive) {
+            val b = overrideCrystalBitmap ?: overrideBitmap ?: return false
+            val s = if (overrideCrystalBitmap != null) overrideCrystalScale else overrideScale
+            return aimBitmap(b, s, toWindow)
+        }
+        val b = glass.crystalBitmap ?: glass.bitmap ?: return false
+        val s = if (glass.crystalBitmap != null) glass.crystalScale else glass.scale
+        return aimBitmap(b, s, toWindow)
+    }
+
+    companion object {
+        /**
+         * Active only during a synchronous offscreen Home capture on the main thread (Recent wallpapers previews,
+         * widget captures). Views that use glass read these instead of their live [WidgetGlass] without touching
+         * or invalidating anything on screen.
+         */
+        var overrideActive = false
+        var overrideBitmap: Bitmap? = null
+        var overrideScale = 1f
+        var overrideCrystalBitmap: Bitmap? = null
+        var overrideCrystalScale = 1f
+        /** Optional per-app icon overrides for palette-tinted themes during a tile capture. */
+        var overrideIcons: Map<com.oneuiclone.home.model.AppKey, Bitmap>? = null
+        /** Optional ARGB folder tint override (0 = keep folder's own) for default frosted folders during a tile capture. */
+        var overrideFolderTint = 0
+        /** Optional dark-text/dark-dots override during a tile capture (null = keep current). */
+        var overrideDarkText: Boolean? = null
+        /** Pre-captured raw bitmaps for colour-key widgets (appWidgetId → raw capture) reused across tiles. */
+        var overrideKeyedWidgets: Map<Int, com.oneuiclone.home.widgets.WidgetManager.WidgetCapture>? = null
+
+        inline fun <T> withOverride(
+            bitmap: Bitmap?,
+            scale: Float,
+            crystalBitmap: Bitmap? = bitmap,
+            crystalScale: Float = scale,
+            icons: Map<com.oneuiclone.home.model.AppKey, Bitmap>? = null,
+            folderTint: Int = 0,
+            darkText: Boolean? = null,
+            keyedWidgets: Map<Int, com.oneuiclone.home.widgets.WidgetManager.WidgetCapture>? = null,
+            block: () -> T,
+        ): T {
+            val prevA = overrideActive; val prevB = overrideBitmap; val prevS = overrideScale
+            val prevCB = overrideCrystalBitmap; val prevCS = overrideCrystalScale
+            val prevI = overrideIcons; val prevF = overrideFolderTint
+            val prevD = overrideDarkText; val prevK = overrideKeyedWidgets
+            overrideActive = true
+            overrideBitmap = bitmap; overrideScale = scale
+            overrideCrystalBitmap = crystalBitmap; overrideCrystalScale = crystalScale
+            overrideIcons = icons; overrideFolderTint = folderTint
+            overrideDarkText = darkText; overrideKeyedWidgets = keyedWidgets
+            return try { block() } finally {
+                overrideActive = prevA; overrideBitmap = prevB; overrideScale = prevS
+                overrideCrystalBitmap = prevCB; overrideCrystalScale = prevCS
+                overrideIcons = prevI; overrideFolderTint = prevF
+                overrideDarkText = prevD; overrideKeyedWidgets = prevK
+            }
+        }
+    }
+
+    private fun aimBitmap(b: Bitmap?, scale: Float, toWindow: Matrix): Boolean {
+        if (b == null) return false
         if (!toWindow.invert(local)) return false
-        local.preScale(glass.scale, glass.scale)                         // glass pixels → window → canvas
+        local.preScale(scale, scale)                                     // glass pixels → window → canvas
         if (bitmap !== b) {
             bitmap = b
             paint.shader = BitmapShader(b, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)

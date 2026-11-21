@@ -21,7 +21,13 @@ class Prefs(context: Context) {
     var appsRows: Int get() = sp.getInt("apps_rows", 6); set(v) = sp.edit().putInt("apps_rows", v).apply()
     /** 85..115 % (Home Up range); stock small/medium/large = 90/100/110. */
     var iconScale: Int get() = sp.getInt("icon_scale", 100); set(v) = sp.edit().putInt("icon_scale", v).apply()
+    /** With Home labels off, names fade in while a finger is on the Home screen (0.263, design opinion 3: "While touching"). */
+    var homeLabelsPeek: Boolean get() = sp.getBoolean("home_labels_peek", false); set(v) = sp.edit().putBoolean("home_labels_peek", v).apply()
     var homeLabels: Boolean get() = sp.getBoolean("home_labels", true); set(v) = sp.edit().putBoolean("home_labels", v).apply()
+    /** The Apps screen's A–Z letter rail (0.262). */
+    var appsLetterRail: Boolean get() = sp.getBoolean("apps_letter_rail", true); set(v) = sp.edit().putBoolean("apps_letter_rail", v).apply()
+    /** Home settles in when you unlock to it: wallpaper eases in, apps ripple in from the fingerprint sensor (0.262). */
+    var unlockSettle: Boolean get() = sp.getBoolean("unlock_settle", true); set(v) = sp.edit().putBoolean("unlock_settle", v).apply()
     var appsLabels: Boolean get() = sp.getBoolean("apps_labels", true); set(v) = sp.edit().putBoolean("apps_labels", v).apply()
     var swipeDownNotifications: Boolean get() = sp.getBoolean("swipe_down_notif", true); set(v) = sp.edit().putBoolean("swipe_down_notif", v).apply()
     /** Swiping up on Home opens search instead of the Apps screen. */
@@ -108,6 +114,8 @@ class Prefs(context: Context) {
     var appBubbles: Boolean get() = sp.getBoolean("app_bubbles", false); set(v) = sp.edit().putBoolean("app_bubbles", v).apply()
     /** First-run setup (SetupActivity) has been shown; it opens by itself only once. */
     var setupShown: Boolean get() = sp.getBoolean("setup_shown", false); set(v) = sp.edit().putBoolean("setup_shown", v).apply()
+    /** Badge look (0.263, design opinion 5): [BADGE_ORANGE] (One UI), [BADGE_MATCHED] (cream pill, number in a deep shade of the Icon colour) or [BADGE_QUIET] (a cream dot). */
+    var badgeStyle: String get() = sp.getString("badge_style", BADGE_MATCHED) ?: BADGE_MATCHED; set(v) = sp.edit().putString("badge_style", v).apply()
     var badges: Boolean get() = sp.getBoolean("badges", true); set(v) = sp.edit().putBoolean("badges", v).apply()
     var badgeNumbers: Boolean get() = sp.getBoolean("badge_numbers", true); set(v) = sp.edit().putBoolean("badge_numbers", v).apply()
     /** Blur the wallpaper behind the Home screen; [homeBlurAmount] is % of the Apps screen blur. */
@@ -135,6 +143,9 @@ class Prefs(context: Context) {
     val wallpaperOpen: Boolean get() = openEffect != null
 
     companion object {
+        const val BADGE_ORANGE = "orange"
+        const val BADGE_MATCHED = "matched"
+        const val BADGE_QUIET = "quiet"
         const val OPEN_SMOOTH = "smooth"
         const val OPEN_ZOOM_IN = "zoom_in"
         const val OPEN_AURA = "aura"

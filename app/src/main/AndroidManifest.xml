@@ -98,6 +98,23 @@
             android:label="Wallpaper and style"
             android:taskAffinity="app.launchii.settings"
             android:theme="@android:style/Theme.DeviceDefault.DayNight" />
+        <!-- Settings' sections (Layout, Gestures, Search, Folders & widgets, Badges & bubbles, Permissions & setup,
+             Backup & advanced, About), one per extra -->
+        <activity
+            android:name=".settings.SettingsSectionActivity"
+            android:autoRemoveFromRecents="true"
+            android:exported="false"
+            android:label="@string/settings_label"
+            android:taskAffinity="app.launchii.settings"
+            android:theme="@android:style/Theme.DeviceDefault.DayNight" />
+        <!-- Settings › Motion (App opening animation): a live preview and a chip per style -->
+        <activity
+            android:name=".settings.OpeningAnimationActivity"
+            android:autoRemoveFromRecents="true"
+            android:exported="false"
+            android:label="App opening animation"
+            android:taskAffinity="app.launchii.settings"
+            android:theme="@android:style/Theme.DeviceDefault.DayNight" />
         <!-- Home screen edit mode › Icons -->
         <activity
             android:name=".settings.IconThemeActivity"

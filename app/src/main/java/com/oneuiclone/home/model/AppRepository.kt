@@ -154,8 +154,7 @@ class AppRepository(private val context: Context, private val iconFactory: IconF
                         // the see-through themes' folder previews: the symbol alone (see AppInfo.previewIcon)
                         preview = when {
                             !themedIcons || darkIcons || minimalIcons -> null
-                            iconLook == com.oneuiclone.home.icons.IconFactory.LOOK_CLEAR_COLOUR -> iconFactory.homeIcon(d, size, night, true, themeAllApps, 1f,
-                                false, pkg, false, com.oneuiclone.home.icons.IconFactory.LOOK_MINIMAL_COLOUR, iconMode).first
+                            iconLook == com.oneuiclone.home.icons.IconFactory.LOOK_CLEAR_COLOUR -> iconFactory.clearPreview(d, size, night, themeAllApps, pkg, iconMode)
                             iconLook.isEmpty() && plateAlpha < 1f -> iconFactory.homeIcon(d, size, night, true, themeAllApps, 1f, false, pkg, true, "", iconMode).first
                             else -> null
                         }?.let { iconFactory.withContour(it) }      // a faint edge round each app in the folder, no plate

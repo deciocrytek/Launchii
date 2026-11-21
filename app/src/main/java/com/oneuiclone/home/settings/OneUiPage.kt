@@ -18,10 +18,16 @@ import android.widget.TextView
 import com.oneuiclone.home.ui.Fonts
 
 /**
- * One UI settings page: rounded cards (26dp), 17sp titles with blue functional summaries, switches tinted with the
- * One UI primary colour. Pages fill [list] in [build], which runs on create and each resume.
+ * One UI settings page: rounded cards (26dp), 17sp titles with functional summaries in the accent, switches tinted
+ * with it. The accent is the colour palette's (Material You, from the wallpaper) in a tone for light or dark mode
+ * (0.263; One UI blue before). Pages fill [list] in [build], which runs on create and each resume.
  */
 abstract class OneUiPage : Activity() {
+
+    companion object {
+        /** A row's title: the page scrolls to that row and flashes it once (Settings search, 0.263). */
+        const val EXTRA_HIGHLIGHT = "app.launchii.settings.HIGHLIGHT"
+    }
 
     protected lateinit var prefs: Prefs
     protected val night get() = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
@@ -29,7 +35,12 @@ abstract class OneUiPage : Activity() {
     protected val cardColor get() = if (night) 0xFF171717.toInt() else 0xFFFCFCFC.toInt()
     protected val text get() = if (night) 0xFFFAFAFA.toInt() else 0xFF000000.toInt()
     protected val sub get() = if (night) 0xFF9A9A9A.toInt() else 0xFF737373.toInt()
-    protected val primary = 0xFF3E91FF.toInt()
+    /** The accent: the colour palette's, light in dark mode and deep in light mode. */
+    protected val primary: Int get() = getColor(if (night) android.R.color.system_accent1_200 else android.R.color.system_accent1_600)
+    /** Text and glyphs on an accent fill. */
+    protected val onPrimary: Int get() = if (night) getColor(android.R.color.system_accent1_800) else Color.WHITE
+    /** A tonal accent fill (selected tiles, ghost pills, round glyph plates). */
+    protected val primarySoft: Int get() = (primary and 0x00FFFFFF) or (if (night) 0x33000000 else 0x24000000)
     protected val d get() = resources.displayMetrics.density
     protected fun dp(v: Float) = (v * d).toInt()
     protected lateinit var list: LinearLayout
@@ -46,9 +57,235 @@ abstract class OneUiPage : Activity() {
     override fun onResume() {
         super.onResume()
         build()
+        intent?.getStringExtra(EXTRA_HIGHLIGHT)?.let { t ->
+            intent.removeExtra(EXTRA_HIGHLIGHT)
+            window.decorView.postDelayed({ if (!isDestroyed) highlight(t) }, 350)
+        }
     }
 
     protected abstract fun build()
+
+    /** Rows by title, for [EXTRA_HIGHLIGHT]; [row] adds each, pages add other views with [register]. */
+    private val rowsByTitle = HashMap<String, View>()
+
+    protected fun register(title: String, v: View) { rowsByTitle[title] = v }
+
+    /** Scrolls row [title] into view and flashes it in the accent (a search result was tapped). */
+    protected fun highlight(title: String) {
+        val v = rowsByTitle[title] ?: return
+        if (!v.isAttachedToWindow || !v.isShown) return
+        var p = v.parent
+        while (p is View && p !is android.widget.ScrollView) p = p.parent
+        (p as? android.widget.ScrollView)?.let { scroll ->
+            val r = android.graphics.Rect(0, 0, v.width, v.height)
+            scroll.offsetDescendantRectToMyCoords(v, r)
+            scroll.smoothScrollTo(0, (r.top - scroll.height / 3).coerceAtLeast(0))
+        }
+        val before = v.foreground
+        val flash = android.graphics.drawable.ColorDrawable(primary).apply { alpha = 0 }
+        v.foreground = flash
+        android.animation.ValueAnimator.ofFloat(0f, 1f, 0.4f, 1f, 0f).apply {
+            duration = 1500; startDelay = 250
+            addUpdateListener { flash.alpha = ((it.animatedValue as Float) * 72).toInt() }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(a: android.animation.Animator) { if (v.foreground === flash) v.foreground = before }
+            })
+            start()
+        }
+    }
+
+    private var pageScroll: android.widget.ScrollView? = null
+
+    /**
+     * Shows [content] as a scrolling page under a status bar scrim, clear of the system bars and the keyboard. A page
+     * rebuilt on resume keeps its scroll position.
+     */
+    protected fun setPage(content: View = list): android.widget.ScrollView {
+        val y = pageScroll?.scrollY ?: 0
+        val scroll = android.widget.ScrollView(this).apply { setBackgroundColor(bg); addView(content); isVerticalScrollBarEnabled = false; clipToPadding = false }
+        pageScroll = scroll
+        val statusScrim = View(this).apply { setBackgroundColor(bg); translationZ = dp(8f).toFloat(); outlineProvider = null }
+        val root = android.widget.FrameLayout(this)
+        root.addView(scroll)
+        root.addView(statusScrim, android.widget.FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0))
+        root.setOnApplyWindowInsetsListener { _, insets ->
+            val bars = insets.getInsets(android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.displayCutout())
+            val ime = insets.getInsets(android.view.WindowInsets.Type.ime())
+            scroll.setPadding(bars.left, bars.top, bars.right, maxOf(bars.bottom, ime.bottom))
+            statusScrim.layoutParams.height = bars.top
+            root.requestLayout()
+            insets
+        }
+        setContentView(root)
+        if (y > 0) scroll.post { scroll.scrollTo(0, y) }
+        return scroll
+    }
+
+    /** A group's name over its card, in the accent, with [small] (the current value) at the end. */
+    protected fun groupHeader(t: String, small: String? = null): LinearLayout {
+        val r = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(20f), dp(6f), dp(20f), dp(8f))
+        }
+        r.addView(TextView(this).apply {
+            text = t; setTextColor(primary); setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            typeface = Fonts.ui(this@OneUiPage, 600)
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        if (small != null) r.addView(TextView(this).apply {
+            text = small; setTextColor(sub); setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            typeface = Fonts.ui(this@OneUiPage, 500)
+        })
+        list.addView(r)
+        return r
+    }
+
+    /** A small explanation under a card. */
+    protected fun caption(t: CharSequence): TextView {
+        val v = TextView(this).apply {
+            text = t; setTextColor(sub); setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            typeface = Fonts.ui(this@OneUiPage, 400)
+            setLineSpacing(0f, 1.15f)
+            setPadding(dp(20f), 0, dp(20f), dp(16f))
+        }
+        list.addView(v, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = -dp(6f) })
+        return v
+    }
+
+    /** A row that opens another page: its summary in the accent and a chevron at the end. */
+    protected fun linkRow(title: String, summary: String?, onClick: () -> Unit): LinearLayout =
+        row(title, summary, primary, android.widget.ImageView(this).apply {
+            setImageDrawable(Chevron(sub, dp(10f), d, right = true))
+            layoutParams = LinearLayout.LayoutParams(dp(10f), dp(10f)).apply { marginStart = dp(12f) }
+        }, onClick)
+
+    /** [r] with a round glyph plate before its texts: [tint] on its soft shade, or white on [tint] when [solid]. */
+    protected fun withIcon(r: LinearLayout, glyph: String, tint: Int = primary, solid: Boolean = false): LinearLayout {
+        val icon = View(this).apply {
+            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(if (solid) tint else (tint and 0x00FFFFFF) or (if (night) 0x33000000 else 0x24000000)) }
+            foreground = GlyphDrawable(glyph, if (solid) Color.WHITE else tint, dp(22f))
+        }
+        r.setPadding(dp(18f), r.paddingTop, r.paddingRight, r.paddingBottom)
+        r.addView(icon, 0, LinearLayout.LayoutParams(dp(40f), dp(40f)).apply { marginEnd = dp(16f) })
+        return r
+    }
+
+    /** A rounded pill button: the accent filled, or a tonal [ghost]. */
+    protected fun pill(label: String, ghost: Boolean = false, glyph: String? = null, onClick: (() -> Unit)? = null): TextView = TextView(this).apply {
+        text = label
+        val ink = if (ghost) primary else onPrimary
+        setTextColor(ink)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        typeface = Fonts.ui(this@OneUiPage, 600)
+        gravity = Gravity.CENTER
+        isSingleLine = true
+        setPadding(dp(if (glyph != null) 12f else 16f), 0, dp(16f), 0)
+        if (glyph != null) { setCompoundDrawablesRelativeWithIntrinsicBounds(GlyphDrawable(glyph, ink, dp(18f)), null, null, null); compoundDrawablePadding = dp(6f) }
+        minWidth = dp(72f)
+        background = android.graphics.drawable.RippleDrawable(ColorStateList.valueOf(if (night) 0x33FFFFFF else 0x1A000000),
+            GradientDrawable().apply { cornerRadius = 100f * d; setColor(if (ghost) primarySoft else primary) }, null)
+        if (onClick != null) setOnClickListener { onClick() } else isClickable = false
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(36f)).apply { marginStart = dp(12f) }
+    }
+
+    /** A view drawn by [paint] (canvas, width, height). */
+    protected class Sketch(context: android.content.Context, private val paint: (android.graphics.Canvas, Float, Float) -> Unit) : View(context) {
+        override fun onDraw(canvas: android.graphics.Canvas) = paint(canvas, width.toFloat(), height.toFloat())
+    }
+
+    /**
+     * Picture tiles in the current card, one per label, the chosen one ringed and tinted in the accent. Each picture
+     * is [picW]×[picH] dp, drawn by [draw] (index, canvas, width, height, chosen); [onPick] gets a newly chosen index.
+     * A tile strip that doesn't apply right now is greyed out and doesn't take taps.
+     */
+    protected fun pictureTiles(labels: List<String>, selected: Int, picW: Float, picH: Float, enabled: Boolean = true,
+                               draw: (Int, android.graphics.Canvas, Float, Float, Boolean) -> Unit, onPick: (Int) -> Unit): LinearLayout {
+        val strip = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(dp(12f), dp(8f), dp(12f), dp(12f)) }
+        labels.forEachIndexed { i, label ->
+            val on = i == selected
+            val tile = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER_HORIZONTAL
+                setPadding(dp(4f), dp(12f), dp(4f), dp(12f))
+                background = GradientDrawable().apply {
+                    cornerRadius = 20f * d
+                    setColor(if (on) primarySoft else Color.TRANSPARENT)
+                    setStroke(dp(2f), if (on) primary else Color.TRANSPARENT)
+                }
+                foreground = android.graphics.drawable.RippleDrawable(ColorStateList.valueOf(if (night) 0x33FFFFFF else 0x1A000000), null,
+                    GradientDrawable().apply { cornerRadius = 20f * d; setColor(Color.WHITE) })
+                contentDescription = label
+                isSelected = on
+                addView(Sketch(this@OneUiPage) { c, w, h -> draw(i, c, w, h, on) }, LinearLayout.LayoutParams(dp(picW), dp(picH)))
+                addView(TextView(this@OneUiPage).apply {
+                    text = label
+                    gravity = Gravity.CENTER_HORIZONTAL
+                    setTextColor(if (on) this@OneUiPage.text else sub)
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                    typeface = Fonts.ui(this@OneUiPage, if (on) 600 else 400)
+                    setPadding(0, dp(8f), 0, 0)
+                }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                if (enabled) setOnClickListener { if (i != selected) onPick(i) }
+            }
+            strip.addView(tile, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = dp(3f); marginEnd = dp(3f) })
+        }
+        if (!enabled) strip.alpha = 0.4f
+        current?.addView(strip)
+        return strip
+    }
+
+    /**
+     * A choice of a few, as One UI's segmented control: [title], the current choice's summary, then the options side
+     * by side with the chosen one filled in the accent.
+     */
+    protected fun segmented(title: String, options: List<String>, selected: Int, summaries: List<String>? = null, onPick: (Int) -> Unit): LinearLayout {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(24f), dp(14f), dp(20f), dp(16f)) }
+        box.addView(TextView(this).apply {
+            text = title; setTextColor(this@OneUiPage.text); setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+            typeface = Fonts.ui(this@OneUiPage, 400)
+        })
+        val summary = TextView(this).apply {
+            setTextColor(sub); setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            typeface = Fonts.ui(this@OneUiPage, 400)
+            setPadding(0, dp(2f), 0, 0)
+            text = summaries?.get(selected)
+            visibility = if (summaries == null) View.GONE else View.VISIBLE
+        }
+        box.addView(summary)
+        val seg = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(4f), dp(4f), dp(4f), dp(4f))
+            background = GradientDrawable().apply { cornerRadius = 100f * d; setColor(if (night) 0xFF2A2A2C.toInt() else 0xFFEDEDF0.toInt()) }
+        }
+        var chosen = selected
+        val cells = ArrayList<TextView>()
+        fun paint() = cells.forEachIndexed { i, c ->
+            val on = i == chosen
+            c.background = GradientDrawable().apply { cornerRadius = 100f * d; setColor(if (on) primary else Color.TRANSPARENT) }
+            c.setTextColor(if (on) onPrimary else this@OneUiPage.text)
+            c.typeface = Fonts.ui(this@OneUiPage, if (on) 600 else 400)
+            c.isSelected = on
+        }
+        options.forEachIndexed { i, o ->
+            val c = TextView(this).apply {
+                text = o; gravity = Gravity.CENTER; isSingleLine = true
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setOnClickListener {
+                    if (i == chosen) return@setOnClickListener
+                    chosen = i; paint()
+                    summaries?.let { summary.text = it[i] }
+                    onPick(i)
+                }
+            }
+            cells += c
+            seg.addView(c, LinearLayout.LayoutParams(0, dp(38f), 1f))
+        }
+        paint()
+        box.addView(seg, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12f) })
+        current?.addView(box)
+        rowsByTitle[title] = box
+        return box
+    }
 
     protected var current: LinearLayout? = null
 
@@ -133,14 +370,14 @@ abstract class OneUiPage : Activity() {
         }
         c.addView(socials, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12f) })
         // a tonal pill: envelope + label centred together
-        val ink = if (night) 0xFFD6E6FF.toInt() else 0xFF0B4FB3.toInt()
+        val ink = primary
         val email = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
             contentDescription = "Email the developer"
             background = android.graphics.drawable.RippleDrawable(
                 ColorStateList.valueOf(if (night) 0x33FFFFFF else 0x1A000000),
-                GradientDrawable().apply { cornerRadius = 100f * d; setColor(if (night) 0xFF1E3350.toInt() else 0xFFDCEBFF.toInt()) }, null)
+                GradientDrawable().apply { cornerRadius = 100f * d; setColor(primarySoft) }, null)
             setOnClickListener { Developer.email(this@OneUiPage) }
         }
         email.addView(android.widget.ImageView(this).apply { setImageDrawable(MarkDrawable(Developer.Marks.EMAIL, ink, dp(18f))) },
@@ -182,6 +419,7 @@ abstract class OneUiPage : Activity() {
         r.addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         trailing?.let { r.addView(it) }
         current?.addView(r)
+        rowsByTitle[title] = r
         return r
     }
 
@@ -289,7 +527,7 @@ abstract class OneUiPage : Activity() {
     protected fun toggle(title: String, summary: String?, value: Boolean, onChange: (Boolean) -> Unit): LinearLayout {
         val sw = Switch(this).apply {
             isChecked = value
-            thumbTintList = ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()), intArrayOf(Color.WHITE, 0xFFFAFAFA.toInt()))
+            thumbTintList = ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()), intArrayOf(if (night) onPrimary else Color.WHITE, 0xFFFAFAFA.toInt()))
             trackTintList = ColorStateList(arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()), intArrayOf(primary, 0xFFB0B0B0.toInt()))
             setOnCheckedChangeListener { _, c -> onChange(c) }
         }

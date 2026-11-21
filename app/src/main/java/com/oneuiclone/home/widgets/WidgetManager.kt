@@ -225,6 +225,103 @@ class WidgetManager(private val activity: Activity) {
             startIntentSender(intent, fillInIntent, flagsMask, flagsValues, extraFlags, null)
     }
 
+    /**
+     * Hardware-safe capture of a widget on Home that can re-frost live against any [WidgetGlass]
+     * (used by Set wallpaper / Wallpaper & style previews and by Recent wallpapers tile overlays).
+     */
+    class WidgetCapture(
+        val content: Bitmap,
+        val glassMask: Bitmap? = null,
+        val keyColor: Int = 0,
+        val keyInner: Int = 0,
+        val opacity: Float = 1f,
+        val radius: Float = 0f,
+        val hasGlass: Boolean = false,
+        /** Cell padding and vertical alignment lift from [com.oneuiclone.home.ui.WidgetContainer], in px. */
+        val pad: Int = 0,
+        val lift: Int = 0,
+    ) {
+        private val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+        private val glassPaint = GlassPaint().apply { paint.xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN) }
+        private val clip = android.graphics.Path()
+        private val dst = Rect()
+        private val keyMatrix = Matrix()
+        private var keyShader: RuntimeShader? = null
+        private var keyPaint: Paint? = null
+        private val shaderMatrix = Matrix()
+        private var lastGlassBmp: Bitmap? = null
+        private var lastGlassShader: BitmapShader? = null
+        private var lastContentShader: BitmapShader? = null
+
+        private fun glassShaderFor(bmp: Bitmap, matrix: Matrix): BitmapShader {
+            val s = if (lastGlassBmp === bmp && lastGlassShader != null) lastGlassShader!!
+            else BitmapShader(bmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP).also { lastGlassBmp = bmp; lastGlassShader = it }
+            s.setLocalMatrix(matrix)
+            return s
+        }
+
+        /** Draws the widget into [canvas] at [dstW]×[dstH], frosted against [glass] at [toWindow]. */
+        fun draw(canvas: Canvas, dstW: Int, dstH: Int, glass: WidgetGlass?, toWindow: Matrix) =
+            drawWithGlass(canvas, dstW, dstH, if (hasGlass) glass?.bitmap else null, glass?.scale ?: 1f, toWindow)
+
+        /** Draws the widget into [canvas] at [dstW]×[dstH], frosted against an explicit [glassBmp]/[glassScale]. */
+        fun drawWithGlass(canvas: Canvas, dstW: Int, dstH: Int, glassBmp: Bitmap?, glassScale: Float, toWindow: Matrix) {
+            if (dstW <= 0 || dstH <= 0) return
+            val saved = canvas.save()
+            if (radius > 0f && content.width > 0) {
+                val r = radius * (dstW / content.width.toFloat())
+                clip.reset()
+                clip.addRoundRect(0f, 0f, dstW.toFloat(), dstH.toFloat(), r, r, android.graphics.Path.Direction.CW)
+                canvas.clipPath(clip)
+            }
+            dst.set(0, 0, dstW, dstH)
+            when {
+                keyColor != 0 -> drawKeyed(canvas, dstW, dstH, glassBmp, glassScale, toWindow)
+                glassMask != null -> {
+                    if (hasGlass && glassBmp != null && toWindow.invert(keyMatrix)) {
+                        keyMatrix.preScale(glassScale, glassScale)
+                        val sc = canvas.saveLayer(0f, 0f, dstW.toFloat(), dstH.toFloat(), null)
+                        canvas.drawBitmap(glassMask, null, dst, paint)
+                        glassPaint.paint.shader = glassShaderFor(glassBmp, keyMatrix)
+                        canvas.drawRect(0f, 0f, dstW.toFloat(), dstH.toFloat(), glassPaint.paint)
+                        canvas.restoreToCount(sc)
+                    }
+                    canvas.drawBitmap(content, null, dst, paint)
+                }
+                else -> canvas.drawBitmap(content, null, dst, paint)
+            }
+            canvas.restoreToCount(saved)
+        }
+
+        private fun drawKeyed(canvas: Canvas, dstW: Int, dstH: Int, glassBmp: Bitmap?, glassScale: Float, toWindow: Matrix) {
+            if (canvas.isHardwareAccelerated) {
+                val sh = keyShader ?: RuntimeShader(ColourKey.AGSL).also { keyShader = it }
+                val p = keyPaint ?: Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).also { keyPaint = it }
+                shaderMatrix.setScale(dstW / content.width.toFloat(), dstH / content.height.toFloat())
+                val contentShader = (lastContentShader ?: BitmapShader(content, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP).also { lastContentShader = it })
+                    .apply { setLocalMatrix(shaderMatrix) }
+                val glassShader = if (hasGlass && glassBmp != null && toWindow.invert(keyMatrix)) {
+                    keyMatrix.preScale(glassScale, glassScale)
+                    glassShaderFor(glassBmp, keyMatrix)
+                } else ColourKey.NO_GLASS
+                sh.setInputShader("content", contentShader)
+                sh.setInputShader("glass", glassShader)
+                sh.setFloatUniform("key", android.graphics.Color.red(keyColor) / 255f, android.graphics.Color.green(keyColor) / 255f,
+                    android.graphics.Color.blue(keyColor) / 255f, android.graphics.Color.alpha(keyColor) / 255f)
+                sh.setFloatUniform("inner", android.graphics.Color.red(keyInner) / 255f, android.graphics.Color.green(keyInner) / 255f,
+                    android.graphics.Color.blue(keyInner) / 255f, android.graphics.Color.alpha(keyInner) / 255f)
+                sh.setFloatUniform("opacity", opacity)
+                sh.setFloatUniform("hasGlass", if (glassShader === ColourKey.NO_GLASS) 0f else 1f)
+                p.shader = sh
+                canvas.drawRect(0f, 0f, dstW.toFloat(), dstH.toFloat(), p)
+            } else {
+                val shaded = ColourKey.shadeSoftware(content, dstW, dstH, keyColor, keyInner, opacity,
+                    if (hasGlass) glassBmp else null, glassScale, toWindow)
+                canvas.drawBitmap(shaded, null, dst, paint)
+            }
+        }
+    }
+
     /** AppWidgetHostView clipped to One UI's 26dp widget radius. */
     class RoundedWidgetView(context: Context) : AppWidgetHostView(context) {
         private val radius = 26f * context.resources.displayMetrics.density
@@ -253,8 +350,83 @@ class WidgetManager(private val activity: Activity) {
                 applyStyle()
             }
         private val styled get() = backgroundOpacity < 1f || glass != null
+        val isKeyed get() = keyed && keyColor != 0
         private val wrapped = ArrayList<GlassDrawable>()
         private val keepStyled = ViewTreeObserver.OnPreDrawListener { applyStyle(); true }
+        private val overrideClip = android.graphics.Path()
+        private val overrideToWindow = Matrix()
+
+        override fun draw(canvas: Canvas) {
+            if (GlassPaint.overrideActive && width > 0 && height > 0) {
+                val sc = canvas.save()
+                overrideClip.reset()
+                overrideClip.addRoundRect(0f, 0f, width.toFloat(), height.toFloat(), radius, radius, android.graphics.Path.Direction.CW)
+                canvas.clipPath(overrideClip)
+                if (keyed && keyColor != 0) {
+                    val cap = GlassPaint.overrideKeyedWidgets?.get(appWidgetId) ?: capture(0.35f)
+                    if (cap != null) {
+                        overrideToWindow.reset(); transformMatrixToGlobal(overrideToWindow)
+                        cap.drawWithGlass(canvas, width, height, GlassPaint.overrideBitmap, GlassPaint.overrideScale, overrideToWindow)
+                    } else super.draw(canvas)
+                } else {
+                    super.draw(canvas)
+                }
+                canvas.restoreToCount(sc)
+                return
+            }
+            super.draw(canvas)
+        }
+
+        /**
+         * Captures this widget into a hardware-safe [WidgetCapture] at [scale] (0..1) so previews can re-frost it
+         * over any wallpaper without touching or flickering the live widget.
+         */
+        fun capture(scale: Float = 1f, pad: Int = 0, lift: Int = 0): WidgetCapture? {
+            if (width == 0 || height == 0) return null
+            val cw = max(1, (width * scale).roundToInt())
+            val ch = max(1, (height * scale).roundToInt())
+            val sx = cw / width.toFloat(); val sy = ch / height.toFloat()
+            fun record(drawBlock: (Canvas) -> Unit): Bitmap? = try {
+                val pic = android.graphics.Picture()
+                val c = pic.beginRecording(cw, ch)
+                c.scale(sx, sy)
+                drawBlock(c)
+                pic.endRecording()
+                val hw = Bitmap.createBitmap(pic, cw, ch, Bitmap.Config.HARDWARE)
+                val sw = hw.copy(Bitmap.Config.ARGB_8888, false)
+                hw.recycle()
+                sw
+            } catch (e: Exception) {
+                android.util.Log.w("OneUiHome", "widget capture failed", e)
+                null
+            }
+            if (keyed && keyColor != 0) {
+                val raw = record { super.draw(it) } ?: return null
+                return WidgetCapture(raw, keyColor = keyColor, keyInner = keyInner, opacity = backgroundOpacity,
+                    radius = radius * sx, hasGlass = glass != null, pad = pad, lift = lift)
+            }
+            if (wrapped.isNotEmpty() && glass != null) {
+                val content = GlassPaint.withOverride(null, 1f) { record { super.draw(it) } } ?: return null
+                val hostToWin = Matrix().also { transformMatrixToGlobal(it) }
+                val winToHost = Matrix()
+                val mask = if (hostToWin.invert(winToHost)) {
+                    record { c ->
+                        val m = Matrix()
+                        for (gd in wrapped) {
+                            gd.locateInto(m)
+                            m.postConcat(winToHost)
+                            c.save()
+                            c.concat(m)
+                            gd.drawable?.draw(c)
+                            c.restore()
+                        }
+                    }
+                } else null
+                return WidgetCapture(content, glassMask = mask, radius = radius * sx, hasGlass = true, pad = pad, lift = lift)
+            }
+            val bmp = record { super.draw(it) } ?: return null
+            return WidgetCapture(bmp, radius = radius * sx, hasGlass = false, pad = pad, lift = lift)
+        }
 
         override fun updateAppWidget(remoteViews: RemoteViews?) {
             super.updateAppWidget(remoteViews)
@@ -565,6 +737,102 @@ class WidgetManager(private val activity: Activity) {
                 return mix(c, bg * c.a, w);
             }
         """
+
+        /** Software equivalent of [AGSL] for offscreen software canvases (Recent wallpapers / Wallpaper & style). */
+        fun shadeSoftware(
+            raw: Bitmap,
+            dstW: Int,
+            dstH: Int,
+            keyColor: Int,
+            keyInner: Int,
+            opacity: Float,
+            glassBmp: Bitmap?,
+            glassScale: Float,
+            toWindow: Matrix,
+        ): Bitmap {
+            val w = raw.width; val h = raw.height
+            val n = w * h
+            val px = IntArray(n)
+            raw.getPixels(px, 0, w, 0, 0, w, h)
+            val keyA = android.graphics.Color.alpha(keyColor)
+            if (keyA < 230) return raw
+            val kr = android.graphics.Color.red(keyColor) / 255f
+            val kg = android.graphics.Color.green(keyColor) / 255f
+            val kb = android.graphics.Color.blue(keyColor) / 255f
+            val hasInner = android.graphics.Color.alpha(keyInner) > 230
+            val ir = android.graphics.Color.red(keyInner) / 255f
+            val ig = android.graphics.Color.green(keyInner) / 255f
+            val ib = android.graphics.Color.blue(keyInner) / 255f
+            val er = ir - kr; val eg = ig - kg; val eb = ib - kb
+            val eLen2 = (er * er + eg * eg + eb * eb).coerceAtLeast(1e-6f)
+
+            val hasGlass = glassBmp != null
+            val gw = glassBmp?.width ?: 1
+            val gh = glassBmp?.height ?: 1
+            val gpx = if (glassBmp != null) IntArray(gw * gh).also { glassBmp.getPixels(it, 0, gw, 0, 0, gw, gh) } else null
+            // Map raw pixel (x, y) → widget local (dstW, dstH) → window → glass pixel
+            val m = Matrix()
+            m.setScale(dstW / w.toFloat(), dstH / h.toFloat())
+            m.postConcat(toWindow)
+            if (glassScale > 0f) m.postScale(1f / glassScale, 1f / glassScale)
+            val mv = FloatArray(9); m.getValues(mv)
+            val m00 = mv[Matrix.MSCALE_X]; val m01 = mv[Matrix.MSKEW_X]; val m02 = mv[Matrix.MTRANS_X]
+            val m10 = mv[Matrix.MSKEW_Y]; val m11 = mv[Matrix.MSCALE_Y]; val m12 = mv[Matrix.MTRANS_Y]
+            val invOp = 1f - opacity
+
+            for (y in 0 until h) {
+                val row = y * w
+                for (x in 0 until w) {
+                    val c = px[row + x]
+                    val ca = c ushr 24
+                    if (ca == 0) continue
+                    val ur = ((c shr 16) and 0xFF) / 255f
+                    val ug = ((c shr 8) and 0xFF) / 255f
+                    val ub = (c and 0xFF) / 255f
+                    val mr: Float; val mg: Float; val mb: Float
+                    if (hasInner) {
+                        val t = (((ur - kr) * er + (ug - kg) * eg + (ub - kb) * eb) / eLen2).coerceIn(0f, 1f)
+                        mr = kr + er * t; mg = kg + eg * t; mb = kb + eb * t
+                    } else {
+                        mr = kr; mg = kg; mb = kb
+                    }
+                    val dr = ur - mr; val dg = ug - mg; val db = ub - mb
+                    val dist = kotlin.math.sqrt(dr * dr + dg * dg + db * db)
+                    if (dist >= 0.08f) continue
+                    val s = ((dist - 0.015f) / (0.08f - 0.015f)).coerceIn(0f, 1f)
+                    val weight = 1f - s * s * (3f - 2f * s)
+                    var gr = 0f; var gg = 0f; var gb = 0f
+                    if (gpx != null) {
+                        val gx = (m00 * x + m01 * y + m02).toInt().coerceIn(0, gw - 1)
+                        val gy = (m10 * x + m11 * y + m12).toInt().coerceIn(0, gh - 1)
+                        val gp = gpx[gy * gw + gx]
+                        gr = ((gp shr 16) and 0xFF) / 255f
+                        gg = ((gp shr 8) and 0xFF) / 255f
+                        gb = (gp and 0xFF) / 255f
+                    }
+                    val caF = ca / 255f
+                    val bgR = mr * opacity + gr * invOp
+                    val bgG = mg * opacity + gg * invOp
+                    val bgB = mb * opacity + gb * invOp
+                    val bgA = if (hasGlass) 1f else opacity
+                    val invW = 1f - weight
+                    val outA = caF * (invW + bgA * weight)
+                    if (outA < 0.004f) {
+                        px[row + x] = 0
+                    } else {
+                        val outR = (ur * caF * invW + bgR * caF * weight) / outA
+                        val outG = (ug * caF * invW + bgG * caF * weight) / outA
+                        val outB = (ub * caF * invW + bgB * caF * weight) / outA
+                        val aI = (outA * 255f + 0.5f).toInt().coerceIn(0, 255)
+                        val rI = (outR * 255f + 0.5f).toInt().coerceIn(0, 255)
+                        val gI = (outG * 255f + 0.5f).toInt().coerceIn(0, 255)
+                        val bI = (outB * 255f + 0.5f).toInt().coerceIn(0, 255)
+                        px[row + x] = (aI shl 24) or (rI shl 16) or (gI shl 8) or bI
+                    }
+                }
+            }
+            return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).apply { setPixels(px, 0, w, 0, 0, w, h) }
+        }
     }
 
     /**
@@ -592,6 +860,8 @@ class WidgetManager(private val activity: Activity) {
         }
 
         /** Drawable coordinates → window. */
+        fun locateInto(m: Matrix) = locate(m)
+
         private fun locate(m: Matrix) {
             m.reset()
             owner.transformMatrixToGlobal(m)
@@ -604,7 +874,7 @@ class WidgetManager(private val activity: Activity) {
         override fun draw(canvas: Canvas) {
             val l = bounds.left.toFloat(); val t = bounds.top.toFloat()
             val r = bounds.right.toFloat(); val b = bounds.bottom.toFloat()
-            drawnBitmap = glass?.bitmap
+            if (!GlassPaint.overrideActive) drawnBitmap = glass?.bitmap
             locate(drawnAt)
             if (glassPaint.aim(glass, drawnAt)) {
                 val sc = canvas.saveLayer(l, t, r, b, null)

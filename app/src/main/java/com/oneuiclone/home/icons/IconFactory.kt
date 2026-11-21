@@ -44,6 +44,8 @@ class IconFactory(private val context: Context) {
         val FORCE_TONAL = setOf("com.t3tools.t3code")
         /** Chrome, drawn as One UI shows it ([createChrome]) rather than from its own icon, whose layout varies by version. */
         private val CHROME = setOf("com.android.chrome", "com.chrome.beta", "com.chrome.dev", "com.chrome.canary")
+        /** Instagram, drawn as its crisp white camera glyph in Clear Colour ([drawInstagramGlyph]) so it doesn't wash out on glass. */
+        private val INSTAGRAM = setOf("com.instagram.android", "com.instagram.lite")
         /**
          * Clear Colour: apps whose plate-coloured parts inside the symbol stay filled ([fillEnclosed]) rather than cut
          * out to glass, as the date on Calendar's page (user, 0.254: its "31" went see-through). YT Music's ring and
@@ -109,6 +111,45 @@ class IconFactory(private val context: Context) {
          */
         fun themeAccent(context: Context): Int =
             if (themeColor != 0) themeColor or 0xFF000000.toInt() else context.getColor(android.R.color.system_accent1_400)
+
+        /** True when this icon style tints its plates/veils with [themeAccent] (Colour palette when themeColor == 0). */
+        fun usesPalette(themed: Boolean, dark: Boolean, minimal: Boolean, look: String): Boolean =
+            themed && !dark && (look == LOOK_CLEAR_COLOUR || (!minimal && look.isEmpty()))
+
+        /**
+         * Estimates Android's Material You Tonal Spot `system_accent1_400` (CIE L* ≈ 60) from a wallpaper's
+         * [android.app.WallpaperColors] so previews of not-yet-applied wallpapers show a matching icon theme.
+         */
+        fun estimateAccent(colors: android.app.WallpaperColors): Int {
+            val seed = colors.primaryColor.toArgb()
+            val hsl = FloatArray(3)
+            androidx.core.graphics.ColorUtils.colorToHSL(seed, hsl)
+            // Keep near-grey wallpapers neutral; otherwise moderate saturation like Material You Tonal Spot.
+            hsl[1] = if (hsl[1] < 0.08f) hsl[1].coerceAtMost(0.10f) else hsl[1].coerceIn(0.24f, 0.56f)
+            // Binary-search HSL lightness to match Material tone 60 (CIE L* = 60, Android's system_accent1_400).
+            var lo = 0.20f; var hi = 0.85f
+            val lab = DoubleArray(3)
+            var out = seed or 0xFF000000.toInt()
+            repeat(8) {
+                val mid = (lo + hi) * 0.5f
+                hsl[2] = mid
+                out = androidx.core.graphics.ColorUtils.HSLToColor(hsl) or 0xFF000000.toInt()
+                androidx.core.graphics.ColorUtils.colorToLAB(out, lab)
+                if (lab[0] < 60.0) lo = mid else hi = mid
+            }
+            return out
+        }
+
+        /** True when two estimated accents are close enough that a small crop nudge shouldn't rebuild preview icons. */
+        fun accentSimilar(a: Int, b: Int): Boolean {
+            if (a == b) return true
+            if (a == 0 || b == 0) return false
+            val la = DoubleArray(3); val lb = DoubleArray(3)
+            androidx.core.graphics.ColorUtils.colorToLAB(a, la)
+            androidx.core.graphics.ColorUtils.colorToLAB(b, lb)
+            val dl = la[0] - lb[0]; val da = la[1] - lb[1]; val db = la[2] - lb[2]
+            return dl * dl + da * da + db * db < 64.0
+        }
         /** Icon theme › Groovy: the glyph cut out of cream, ringed by three 70s stripes in the app's colour family. */
         const val LOOK_GROOVY = "groovy"
         /** The playful looks (the Zoom In card fills in around them: LaunchCard.PLAYFUL_FROM_ALPHA). */
@@ -138,9 +179,20 @@ class IconFactory(private val context: Context) {
         private const val CLEAR_GLOW = 0x29FFFFFF
         /** The sheen over the symbol's top (27 % white), and its shadow's strength. */
         private const val CLEAR_SHEEN = 0x45FFFFFF
+        /** The share of [CLEAR_SHEEN] a mostly black symbol gets (0.275). */
+        private const val CLEAR_SHEEN_DARK = 0.25f
         private const val CLEAR_SHADOW = 0.26f
+        /**
+         * Clear Colour's fine edge: a hairline of shade hugging the symbol, centred (no drop), so the symbol stands
+         * out from glass that matches the wallpaper (user, 0.261: mockup K of mockups/icon-contrast-3.html; round 2's
+         * drop shadow was "too obvious"). Its blur (sigma, a share of the icon) and strength.
+         */
+        private const val CLEAR_EDGE_SIGMA = 0.008f
+        private const val CLEAR_EDGE = 0.45f
         /** Chrome's logo radius, as a share of the icon. */
         private const val CLEAR_CHROME_RADIUS = 0.37f
+        /** Instagram's white camera glyph width on Clear Colour glass, as a share of the icon (matches the real icon's scale). */
+        private const val CLEAR_INSTAGRAM_SIZE = 0.68f
         /** A foreground still covering more than this share of the icon once its plate's colour is cut out is the whole art: shown whole. */
         private const val CLEAR_FULL_ART = 0.8f
         /** Under this share left, the cut took the whole symbol. */
@@ -182,6 +234,14 @@ class IconFactory(private val context: Context) {
         private const val CLEAR_FILL_MAX_LUMINANCE = 0.75f
         /** A plain symbol's black parts in its plate's colour at this brightness (white parts at full). */
         private const val CLEAR_DEEP = 0.32f
+        /**
+         * Clear Colour legibility for bold red & purple icons (mockup I of mockups/clear-red-purple-round-2.html):
+         * icons where at least [CLEAR_RP_SHARE] of the glyph is saturated red/purple get a cool-hue split, 78 %
+         * translucent frosted white infill inside walled-in white cutouts (YT Music, Skipii), and a subtle top bevel.
+         */
+        private const val CLEAR_RP_SHARE = 0.35f
+        private const val CLEAR_FROST_INFILL = 0.78f
+        private const val CLEAR_RP_BEVEL = 0.34f
         /** iOS Dark's plate, top to foot (measured), and its overall colour for the Zoom In card. */
         private const val IOS_DARK_TOP = 0xFF333333.toInt()
         private const val IOS_DARK_BOTTOM = 0xFF101010.toInt()
@@ -846,7 +906,7 @@ class IconFactory(private val context: Context) {
      * A white glyph at the size it has on the themed plate (so Minimal icons line up with Themed and Frosted ones),
      * over a soft shadow so it still reads on a light wallpaper. Recycles [glyph].
      */
-    private fun minimal(glyph: Bitmap, size: Int): Bitmap {
+    private fun minimal(glyph: Bitmap, size: Int, edge: Boolean = false): Bitmap {
         val out = blank(size)
         val c = Canvas(out)
         val offset = IntArray(2)
@@ -854,6 +914,7 @@ class IconFactory(private val context: Context) {
             maskFilter = android.graphics.BlurMaskFilter(size * 0.03f, android.graphics.BlurMaskFilter.Blur.NORMAL)
         }, offset)
         c.drawBitmap(shadow, offset[0].toFloat(), offset[1] + size * 0.012f, Paint(Paint.FILTER_BITMAP_FLAG).apply { color = 0x47000000 })
+        if (edge) symbolEdge(c, glyph, size)
         c.drawBitmap(glyph, 0f, 0f, bitmapPaint)
         shadow.recycle()
         glyph.recycle()
@@ -1165,6 +1226,7 @@ class IconFactory(private val context: Context) {
         }
         clearSheen(glyph)
         softShadow(c, glyph, size, CLEAR_SHADOW)
+        symbolEdge(c, glyph, size)
         c.drawBitmap(glyph, 0f, 0f, bitmapPaint)
         glyph.recycle()
         // Icon contour: the same edge as Default icons (One UI's emboss), not 0.231's white rim (user, 0.242)
@@ -1249,15 +1311,220 @@ class IconFactory(private val context: Context) {
         }
     }
 
-    /** Light from above on a Clear Colour symbol: a white sheen over its top, gone by about 60 % of the way down. Off with Icon contour. */
+    /**
+     * Light from above on a Clear Colour symbol: a white sheen over its top, gone by about 60 % of the way down. Off with
+     * Icon contour. A mostly black symbol (GitHub, T3, X, Threads) gets [CLEAR_SHEEN_DARK] of it: on black the full
+     * sheen read as a grey top (user, 0.275: "it brightens the top that much").
+     */
     private fun clearSheen(glyph: Bitmap) {
         if (!iconShine) return
         val box = opaqueBounds(glyph)
-        if (!box.isEmpty) Canvas(glyph).drawPaint(Paint().apply {
+        if (box.isEmpty) return
+        val k = 1f - (1f - CLEAR_SHEEN_DARK) * smooth(0.35f, 0.7f, darkShare(glyph, box))
+        val a = ((CLEAR_SHEEN ushr 24) * k).roundToInt().coerceIn(0, 255)
+        Canvas(glyph).drawPaint(Paint().apply {
             shader = android.graphics.LinearGradient(0f, box.top.toFloat(), 0f, box.top + box.height() * 0.6f,
-                CLEAR_SHEEN, 0x00FFFFFF, Shader.TileMode.CLAMP)
+                (a shl 24) or 0x00FFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP)
             xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_ATOP)
         })
+    }
+
+    /** The share (0–1, by opacity) of [glyph] inside [box] that is black or near-black grey. */
+    private fun darkShare(glyph: Bitmap, box: Rect): Float {
+        val w = box.width()
+        val px = IntArray(w * box.height())
+        glyph.getPixels(px, 0, w, box.left, box.top, w, box.height())
+        var dark = 0f
+        var all = 0f
+        for (p in px) {
+            val a = (p ushr 24) / 255f
+            if (a < 0.05f) continue
+            all += a
+            dark += a * (1f - smooth(0.16f, 0.32f, luminance(p))) * (1f - smooth(0.1f, 0.2f, chroma(p)))
+        }
+        return if (all > 0f) dark / all else 0f
+    }
+
+    /**
+     * Subtle raised-acrylic catchlight along the top edge of bold red/purple Clear Colour glyphs (mockup I): the glyph
+     * minus a softly blurred copy of itself nudged down leaves a crisp white rim along upward-facing contours.
+     */
+    private fun clearTopBevel(glyph: Bitmap, size: Int) {
+        if (!iconShine) return
+        val dy = max(1f, size * 0.015f)
+        val offset = IntArray(2)
+        val shifted = glyph.extractAlpha(Paint().apply { maskFilter = blur(max(0.5f, size * 0.004f)) }, offset)
+        val bevel = blank(size)
+        Canvas(bevel).apply {
+            drawBitmap(glyph, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG).apply {
+                colorFilter = android.graphics.PorterDuffColorFilter(Color.WHITE, PorterDuff.Mode.SRC_IN)
+            })
+            drawBitmap(shifted, offset[0].toFloat(), offset[1] + dy, Paint(Paint.FILTER_BITMAP_FLAG).apply {
+                xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT)
+            })
+        }
+        shifted.recycle()
+        Canvas(glyph).drawBitmap(bevel, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG).apply {
+            alpha = (255 * CLEAR_RP_BEVEL).roundToInt()
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_ATOP)
+        })
+        bevel.recycle()
+    }
+
+    /** How strongly [p] sits in the bold red / purple / magenta band (0–1, smooth shoulders for gradients). */
+    private fun redPurpleWeight(p: Int, hsl: FloatArray): Float {
+        val ch = chroma(p)
+        if (ch <= 0.22f) return 0f
+        androidx.core.graphics.ColorUtils.colorToHSL(p, hsl)
+        val h = hsl[0]
+        val hw = when {
+            h >= 272f || h <= 12f -> 1f
+            h > 252f -> smooth(252f, 272f, h)
+            h < 28f -> 1f - smooth(12f, 28f, h)
+            else -> 0f
+        }
+        return if (hw <= 0f) 0f else hw * smooth(0.22f, 0.42f, ch)
+    }
+
+    /** Alpha-weighted share of [px] that falls in the bold red / purple band. */
+    private fun redPurpleShare(px: IntArray): Float {
+        val hsl = FloatArray(3)
+        var total = 0f
+        var rp = 0f
+        for (p in px) {
+            val a = (p ushr 24) / 255f
+            if (a <= 0.05f) continue
+            total += a
+            rp += a * redPurpleWeight(p, hsl)
+        }
+        return if (total > 0f) rp / total else 0f
+    }
+
+    /** How strongly [p] sits in the warm red / crimson band of a multicolor icon (0–1, smooth shoulders). */
+    private fun redSegmentWeight(p: Int, hsl: FloatArray): Float {
+        val ch = chroma(p)
+        if (ch <= 0.22f) return 0f
+        androidx.core.graphics.ColorUtils.colorToHSL(p, hsl)
+        val h = hsl[0]
+        val hw = when {
+            h >= 340f || h <= 14f -> 1f
+            h > 315f -> smooth(315f, 340f, h)
+            h < 28f -> 1f - smooth(14f, 28f, h)
+            else -> 0f
+        }
+        return if (hw <= 0f) 0f else hw * smooth(0.22f, 0.42f, ch)
+    }
+
+    /**
+     * Mockup J red-segment polish for multicolor Clear Colour icons (Photos, Chrome, Gmail, Drive, etc.): applies
+     * Option I's cool cherry-crimson shift and gentle dark-crimson lift only to red/crimson pixels, leaving yellow,
+     * green, blue, and neutral parts untouched, with a subtle top catchlight along red top edges when [iconShine] is on.
+     */
+    private fun coolShiftRedSegment(px: IntArray, size: Int) {
+        val hsl = FloatArray(3)
+        val alphaRow = if (iconShine) IntArray(px.size) { px[it] ushr 24 } else null
+        val step = max(1, (size * 0.014f).roundToInt())
+        for (i in px.indices) {
+            val p = px[i]
+            val a = p ushr 24
+            if (a == 0) continue
+            val rw = redSegmentWeight(p, hsl)
+            if (rw <= 0f) continue
+            val h = hsl[0]
+            val s = hsl[1]
+            val l = hsl[2]
+            val hNew = (h - 7f + 360f) % 360f
+            val sNew = (s * 1.08f).coerceIn(0f, 1f)
+            val lNew = if (l < 0.44f) (l + 0.09f).coerceIn(0.44f, 0.52f) else (l - 0.02f).coerceIn(0.46f, 0.54f)
+            val shifted = androidx.core.graphics.ColorUtils.HSLToColor(floatArrayOf(hNew, sNew, lNew))
+            var rgb = androidx.core.graphics.ColorUtils.blendARGB(p or 0xFF000000.toInt(), shifted, rw)
+            if (alphaRow != null) {
+                val y = i / size
+                val above = if (y >= step) alphaRow[i - step * size] else 0
+                val bevel = ((a - above) / 255f).coerceIn(0f, 1f) * 0.28f * rw
+                if (bevel > 0.005f) rgb = androidx.core.graphics.ColorUtils.blendARGB(rgb, Color.WHITE, bevel)
+            }
+            px[i] = (a shl 24) or (rgb and 0x00FFFFFF)
+        }
+    }
+
+    /**
+     * Mockup I cool-hue split for bold red & purple glyphs on Clear Colour glass: nudges warm reds cooler into crisp
+     * cherry-crimson and deep purples/magentas cooler & brighter into electric violet-fuchsia so they separate from
+     * warm/mid-tone glass without altering the glass plate itself.
+     */
+    private fun coolShiftRedPurple(px: IntArray, plain: Boolean) {
+        val hsl = FloatArray(3)
+        for (i in px.indices) {
+            val p = px[i]
+            val a = p ushr 24
+            if (a == 0) continue
+            val w = redPurpleWeight(p, hsl)
+            val h = hsl[0]
+            val s = hsl[1]
+            val l = hsl[2]
+            if (w <= 0f) {
+                // Keep warm amber/gold tail of gradients (Instagram) slightly lifted so it flows smoothly
+                if (plain && h in 28f..62f && chroma(p) > 0.25f) {
+                    val boosted = androidx.core.graphics.ColorUtils.HSLToColor(
+                        floatArrayOf(h, (s * 1.12f).coerceIn(0f, 1f), (l + 0.08f).coerceIn(0.58f, 0.76f))
+                    )
+                    px[i] = (a shl 24) or (boosted and 0x00FFFFFF)
+                }
+                continue
+            }
+            val shifted = if (!plain) {
+                // Solid/colourful red & purple shapes (YT Music, Skipii): crisp -5° cherry-crimson split
+                val hNew = (h - 5f + 360f) % 360f
+                val sNew = (s * 1.05f).coerceIn(0f, 1f)
+                val lNew = if (h >= 330f || h <= 22f) (l - 0.03f).coerceIn(0.44f, 0.50f) else (l + 0.08f).coerceIn(0.46f, 0.66f)
+                androidx.core.graphics.ColorUtils.HSLToColor(floatArrayOf(hNew, sNew, lNew))
+            } else {
+                // Recoloured thin/gradient glyphs (Instagram, Twitch): electric violet / cherry-pink lift
+                val hNew = if (h >= 252f) (h - 18f + 360f) % 360f else (h - 10f + 360f) % 360f
+                val sNew = (s * 1.18f).coerceIn(0f, 1f)
+                val lNew = if (h >= 252f) (l + 0.16f).coerceIn(0.54f, 0.72f) else (l + 0.14f).coerceIn(0.56f, 0.72f)
+                androidx.core.graphics.ColorUtils.HSLToColor(floatArrayOf(hNew, sNew, lNew))
+            }
+            val blended = androidx.core.graphics.ColorUtils.blendARGB(p or 0xFF000000.toInt(), shifted, w)
+            px[i] = (a shl 24) or (blended and 0x00FFFFFF)
+        }
+    }
+
+    /**
+     * Mockup I frosted cutout infill: for bold red/purple icons whose walled-in interior marks were originally white
+     * (YT Music's ring & play triangle, Skipii's >>), fill those enclosed cutouts with [CLEAR_FROST_INFILL] translucent
+     * white frost instead of letting mid-tone glass swallow them.
+     */
+    private fun fillEnclosedFrost(px: IntArray, bg: IntArray, size: Int) {
+        val n = size * size
+        val open = BooleanArray(n)
+        val stack = IntArray(n)
+        var top = 0
+        fun push(i: Int) { if (!open[i] && Color.alpha(px[i]) < 250) { open[i] = true; stack[top++] = i } }
+        for (k in 0 until size) { push(k); push((size - 1) * size + k); push(k * size); push(k * size + size - 1) }
+        while (top > 0) {
+            val i = stack[--top]
+            val x = i % size
+            val y = i / size
+            if (x > 0) push(i - 1)
+            if (x < size - 1) push(i + 1)
+            if (y > 0) push(i - size)
+            if (y < size - 1) push(i + size)
+        }
+        for (i in 0 until n) {
+            if (open[i] || Color.alpha(px[i]) == 255) continue
+            val b = bg[i]
+            // Only frost cutouts where the original plate showing through was light & neutral (white marks)
+            if (Color.alpha(b) < 128 || luminance(b) <= 0.72f || chroma(b) >= 0.20f) continue
+            val p = px[i]
+            val fa = Color.alpha(p) / 255f
+            val ba = CLEAR_FROST_INFILL * (1f - fa)
+            val a = fa + ba
+            if (a <= 0f) continue
+            fun ch(fc: Int) = ((fc * fa + 255f * ba) / a).roundToInt().coerceIn(0, 255)
+            px[i] = Color.argb((a * 255f).roundToInt().coerceIn(0, 255), ch(Color.red(p)), ch(Color.green(p)), ch(Color.blue(p)))
+        }
     }
 
     /**
@@ -1265,15 +1532,23 @@ class IconFactory(private val context: Context) {
      * no plate or glass, over Minimal's soft shadow (user, 0.235: "just the inner icon of the frosted coloured icons").
      * Art with no background to take away shows whole, as in Clear Colour.
      */
-    fun createMinimalColour(src: Drawable, size: Int, pkg: String?): Bitmap {
+    fun createMinimalColour(src: Drawable, size: Int, pkg: String?, edge: Boolean = false): Bitmap {
         val glyph = clearGlyph(src, size, pkg) ?: clearArt(src, size) ?: run {
             val layers = blank(size)
             ownIcon(Canvas(layers), src, size)
             return clip(layers, size)
         }
         clearSheen(glyph)
-        return minimal(glyph, size)
+        return minimal(glyph, size, edge)
     }
+
+    /**
+     * A Clear Colour app's folder preview (AppInfo.previewIcon): Minimal Colour's symbol with Clear Colour's fine edge,
+     * as on Home; whatever homeIcon gives for Minimal Colour if that fails.
+     */
+    fun clearPreview(d: Drawable, size: Int, night: Boolean, themeAll: Boolean, pkg: String?, lookMode: String): Bitmap =
+        runCatching { createMinimalColour(d, size, pkg, edge = true) }.getOrNull()
+            ?: homeIcon(d, size, night, true, themeAll, 1f, false, pkg, false, LOOK_MINIMAL_COLOUR, lookMode).first
 
     /**
      * Clear Colour's symbol, on transparent:
@@ -1293,6 +1568,14 @@ class IconFactory(private val context: Context) {
         val g = Canvas(glyph)
         if (pkg in CHROME) {
             drawChromeLogo(g, s / 2f, s / 2f, s * CLEAR_CHROME_RADIUS)
+            val px = IntArray(size * size)
+            glyph.getPixels(px, 0, size, 0, 0, size, size)
+            coolShiftRedSegment(px, size)
+            glyph.setPixels(px, 0, size, 0, 0, size, size)
+            return glyph
+        }
+        if (pkg in INSTAGRAM) {
+            drawInstagramGlyph(g, s / 2f, s / 2f, s * CLEAR_INSTAGRAM_SIZE)
             return glyph
         }
         val d = src as? AdaptiveIconDrawable
@@ -1351,7 +1634,15 @@ class IconFactory(private val context: Context) {
                             ((Color.red(b) * k).roundToInt() shl 16) or ((Color.green(b) * k).roundToInt() shl 8) or (Color.blue(b) * k).roundToInt()
                     }
                 }
+                val boldRedPurple = redPurpleShare(px) >= CLEAR_RP_SHARE
+                if (boldRedPurple) {
+                    coolShiftRedPurple(px, plain)
+                    if (!plain && pkg !in CLEAR_KEEP_INSIDE) fillEnclosedFrost(px, bg, size)
+                } else if (!plain) {
+                    coolShiftRedSegment(px, size)
+                }
                 glyph.setPixels(px, 0, size, 0, 0, size, size)
+                if (boldRedPurple) clearTopBevel(glyph, size)
                 return glyph
             }
         }
@@ -1528,6 +1819,16 @@ class IconFactory(private val context: Context) {
     }
 
     /** A faint soft shadow of [glyph] just under it, [alpha] black. */
+    /** Clear Colour's fine edge ([CLEAR_EDGE]): the symbol's shape, softly blurred, in black, centred under it. */
+    private fun symbolEdge(c: Canvas, glyph: Bitmap, size: Int) {
+        val offset = IntArray(2)
+        val edge = glyph.extractAlpha(Paint().apply { maskFilter = blur(size * CLEAR_EDGE_SIGMA) }, offset)
+        c.drawBitmap(edge, offset[0].toFloat(), offset[1].toFloat(), Paint(Paint.FILTER_BITMAP_FLAG).apply {
+            color = Color.BLACK; alpha = (255 * CLEAR_EDGE).roundToInt()
+        })
+        edge.recycle()
+    }
+
     private fun softShadow(c: Canvas, glyph: Bitmap, size: Int, alpha: Float) {
         val offset = IntArray(2)
         val drop = glyph.extractAlpha(Paint().apply { maskFilter = blur(size * 0.009f) }, offset)
@@ -1640,6 +1941,31 @@ class IconFactory(private val context: Context) {
         }
         c.drawCircle(cx, cy, ring, p.apply { color = Color.WHITE })
         c.drawCircle(cx, cy, blue, p.apply { color = 0xFF4285F4.toInt() })
+    }
+
+    /**
+     * Instagram's Soft Frosted White camera glyph for Clear Colour: the real icon's full 3-part white mark ([w] × [w]
+     * centred at [cx],[cy]) rendered in a uniform 80 % frosted white (#CCFFFFFF) all the way around so it stays calm
+     * and glare-free without darkening toward the bottom.
+     */
+    private fun drawInstagramGlyph(c: Canvas, cx: Float, cy: Float, w: Float) {
+        val color = 0xCCFFFFFF.toInt()
+        val stroke = w * 0.094f
+        val half = (w - stroke) / 2f
+        val frameRect = RectF(cx - half, cy - half, cx + half, cy + half)
+        val frameRx = w * 0.225f
+        val frostStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            this.color = color
+            strokeWidth = stroke
+        }
+        c.drawRoundRect(frameRect, frameRx, frameRx, frostStroke)
+        c.drawCircle(cx, cy, w * 0.212f, frostStroke)
+        val dotOffset = w * 0.267f
+        c.drawCircle(cx + dotOffset, cy - dotOffset, w * 0.062f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            this.color = color
+        })
     }
 
     /**

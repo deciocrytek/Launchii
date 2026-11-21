@@ -1,6 +1,8 @@
 package com.oneuiclone.home.ui
 
+import android.animation.TimeInterpolator
 import android.animation.ValueAnimator
+import android.view.animation.PathInterpolator
 import android.view.View
 import com.oneuiclone.home.motion.Easing
 import kotlin.math.hypot
@@ -16,6 +18,19 @@ class TouchRipple(private val samsungPxScale: Float) {
         const val DURATION = 650L
         const val DISTANCE_UNIT = 50f
         const val DELAY_PER_UNIT = 6L
+
+        /** Press bounce: the ripple curve only up to its peak (items furthest in, ~438 ms), then straight back. */
+        private const val PEAK_FRACTION = 0.674f
+        private const val PEAK_MS = DURATION * PEAK_FRACTION
+        private const val BACK_MS = 300f
+        const val BOUNCE_MS = 738L                       // PEAK_MS + BACK_MS
+        private val PEAK = Easing.RIPPLE.getInterpolation(PEAK_FRACTION)          // ~1.19
+        private val BACK: TimeInterpolator = PathInterpolator(0.4f, 0f, 0.2f, 1f) // leaves the peak at rest speed
+        private val BOUNCE = TimeInterpolator { f ->
+            val t = f * BOUNCE_MS
+            if (t < PEAK_MS) Easing.RIPPLE.getInterpolation(t / DURATION)
+            else PEAK * (1f - BACK.getInterpolation(((t - PEAK_MS) / BACK_MS).coerceAtMost(1f)))
+        }
     }
 
     private class Entry(val view: View, val anim: ValueAnimator, val baseX: Float, val baseY: Float)
@@ -23,7 +38,15 @@ class TouchRipple(private val samsungPxScale: Float) {
     private val active = ArrayList<Entry>()
 
     /** @param tx,ty touch point in screen coordinates. */
-    fun start(views: List<View>, tx: Float, ty: Float) {
+    fun start(views: List<View>, tx: Float, ty: Float) = launch(views, tx, ty, DURATION, Easing.RIPPLE)
+
+    /**
+     * Press (0.279, press-ripple mockup E): the start of [start]'s ripple, up to where the items are furthest in, then
+     * each goes right back in 300 ms by itself. Nothing waits for the long-press, hold or lift.
+     */
+    fun bounce(views: List<View>, tx: Float, ty: Float) = launch(views, tx, ty, BOUNCE_MS, BOUNCE)
+
+    private fun launch(views: List<View>, tx: Float, ty: Float, length: Long, curve: TimeInterpolator) {
         reset()
         val loc = IntArray(2)
         for (v in views) {
@@ -41,8 +64,8 @@ class TouchRipple(private val samsungPxScale: Float) {
             val baseX = v.translationX
             val baseY = v.translationY
             val anim = ValueAnimator.ofFloat(0f, 1f).apply {
-                duration = DURATION
-                interpolator = Easing.RIPPLE
+                duration = length
+                interpolator = curve
                 startDelay = (DELAY_PER_UNIT * (d / (DISTANCE_UNIT * samsungPxScale))).toLong()
                 addUpdateListener {
                     val f = it.animatedValue as Float

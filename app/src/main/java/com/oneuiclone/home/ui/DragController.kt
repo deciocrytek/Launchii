@@ -82,6 +82,8 @@ class DragController(
     }
 
     var isDragging = false; private set
+    /** An item dropped on Remove (not one dragged out of a folder, not a widget): for the Undo pill. */
+    var onRemoved: ((HomeItem) -> Unit)? = null
     private var folderDrag: FolderDrag? = null
     private var folderExitPending: Runnable? = null
     private var springPending: Runnable? = null
@@ -114,8 +116,12 @@ class DragController(
     private var shownKey: String? = null
     private var pendingKey: String? = null
     private var reorderPending: Runnable? = null
-    /** Side of the dragged icon (a large folder's container is wider than an app icon). */
+    /** Size of the dragged icon (a large folder's Liquid Crystal pane is taller than it is wide). */
     private var dragSize = 0
+    private var dragHeight = 0
+    /** Free-cell dots and the landing outline (design opinion 9), under the drag view. */
+    private var guides: DragGuides? = null
+    private var lastTarget: Target? = null
 
     /** [folder]: the app is dragged from an open folder, which stays up while the drag is on it. */
     fun start(src: IconView, it: HomeItem?, a: AppInfo?, apps: Boolean, x: Float, y: Float, folder: FolderDrag? = null) {
@@ -126,6 +132,7 @@ class DragController(
         source = src; item = it; app = a; fromApps = apps
         touchX = x; touchY = y
         dragSize = src.iconSizePx()
+        dragHeight = src.iconHeightPx()
         val r = Rect(); src.iconBoundsOnScreen(r)
         startX = r.left.toFloat(); startY = r.top.toFloat()
         src.iconVisible = false
@@ -133,7 +140,7 @@ class DragController(
         src.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
 
         val dv = DragView(context, bmp, shape = src !is FolderIconView)
-        overlay.addView(dv, FrameLayout.LayoutParams(dragSize, dragSize))
+        overlay.addView(dv, FrameLayout.LayoutParams(dragSize, dragHeight))
         dv.x = startX; dv.y = startY
         dv.elevation = dp.dp(8f)
         dragView = dv
@@ -166,6 +173,7 @@ class DragController(
             removeBar = rb
         }
         if (folder == null) animateBackground(1f, 150)                   // (in a folder: the folder's background)
+        if (folder == null) updateGuides(currentTarget())                 // (in a folder: once it leaves it)
     }
 
     /** Long-press + move on a widget: it lifts slightly and follows the finger, keeping the grab point. */
@@ -190,6 +198,7 @@ class DragController(
         rb.animate().alpha(1f).setDuration(150).start()
         removeBar = rb
         animateBackground(1f, 150)
+        updateGuides(currentTarget())
     }
 
     /**
@@ -249,7 +258,7 @@ class DragController(
     }
 
     private fun snapshot(v: FolderIconView): Bitmap {
-        val b = Bitmap.createBitmap(v.iconSizePx(), v.iconSizePx(), Bitmap.Config.ARGB_8888)
+        val b = Bitmap.createBitmap(v.iconSizePx(), v.iconHeightPx(), Bitmap.Config.ARGB_8888)
         val c = Canvas(b)
         // Hide the label first: without it the icon re-centres lower in the cell, so iconTop() changes.
         val label = v.showLabel
@@ -301,7 +310,7 @@ class DragController(
         val dv = dragView ?: return
         if (widgetSource != null) { dv.x = touchX - grabX; dv.y = touchY - grabY; return }
         val tx = touchX - dragSize / 2f
-        val ty = touchY - dragSize / 2f
+        val ty = touchY - dragHeight / 2f
         val t = ((android.os.SystemClock.uptimeMillis() - pickupStart) / 317f).coerceIn(0f, 1f)
         val e = Easing.DRAG_TRANSITION.getInterpolation(t)
         dv.x = startX + (tx - startX) * e
@@ -315,6 +324,7 @@ class DragController(
         val dp = dpProvider()
         removeBar?.setActive(y < (removeBar?.barHeight ?: 0))
         folderDrag?.let { fd ->
+            hideGuides()
             if (removeBar?.active == true || fd.isInside(x, y)) {
                 cancelFolderExit()
                 if (removeBar?.active != true) fd.dragOver(x, y)
@@ -343,6 +353,7 @@ class DragController(
                         ws.addView(cl)
                     }
                     if (target in 0 until ws.pageCount) ws.snapToPage(target)
+                    if (isDragging && folderDrag == null) ws.post { if (isDragging && folderDrag == null) updateGuides(currentTarget()) }
                 }
                 pageFlipPending = r
                 main.postDelayed(r, 500)
@@ -354,6 +365,7 @@ class DragController(
         val t = if (removeBar?.active == true) null else currentTarget()
         if (widgetSource == null) updateHover(t)
         updateReorder(t)
+        if (folderDrag == null) updateGuides(t)                          // (a spring-open may have just taken over)
     }
 
     private fun currentTarget(): Target? =
@@ -393,6 +405,7 @@ class DragController(
         val fd = openFolderForDrop(v, folder, a, dragged) ?: return
         item = dragged
         folderDrag = fd
+        hideGuides()
         addingTo = folder
         endReorder(revert = true)
         v.folderBgScale = 1f
@@ -492,6 +505,7 @@ class DragController(
                 ?.translationY((p.second - it.y) * dp.cellHeight.toFloat())?.setDuration(200)?.setInterpolator(Easing.BASIC)?.start()
         }
         shownPushes = pushes; shownKey = key
+        if (isDragging && folderDrag == null) updateGuides(lastTarget)    // (the free cells changed)
     }
 
     /** Drag ended: the preview is either committed by the rebind or must be put back. */
@@ -567,6 +581,7 @@ class DragController(
     fun drop() {
         if (!isDragging) return
         isDragging = false
+        fadeGuides()
         pickupAnim?.cancel(); pickupAnim = null                         // (it would fight the landing's scale)
         pageFlipPending?.let { main.removeCallbacks(it) }; pageFlipPending = null
         cancelFolderExit()
@@ -597,6 +612,7 @@ class DragController(
             if (item is HomeItem.Folder) m.items.removeAll { it is HomeItem.App && it.folderId == item!!.id }
             if (fromFolder >= 0) dissolveIfNeeded(m, fromFolder)
             m.save()
+            if (fromFolder < 0) onRemoved?.invoke(item!!)
             dv.animate().scaleX(0f).scaleY(0f).alpha(0f).setDuration(200).withEndAction { overlay.removeView(dv) }.start()
             dragView = null
             rebind(); cleanup(); return
@@ -698,9 +714,9 @@ class DragController(
         dragView = null
         cleanup()
         val large = folder as? LargeFolderIconView
-        // the preview slot an app at [r] shows in, -1 if none; a large folder's stack takes everything from the 4th on
+        // the preview slot an app at [r] shows in, -1 if none (large folders show 4 apps per page)
         fun slotOf(r: Int) = large?.slotFor(r) ?: folder.slotOfRank(r)
-        fun ownSlot(r: Int) = slotOf(r).let { it >= 0 && !(large?.hasStack == true && it == 3) }
+        fun ownSlot(r: Int) = slotOf(r) >= 0
         folder.hiddenPreviews = listOfNotNull(rank.takeIf { ownSlot(it) }?.let { slotOf(it) }, if (made != null) 0 else null).toSet()
         folder.folderBgScale = plateFrom
         if (made != null) folder.labelAlpha = 0f
@@ -821,6 +837,7 @@ class DragController(
     fun cancel() {
         if (!isDragging) return
         isDragging = false
+        fadeGuides()
         pickupAnim?.cancel(); pickupAnim = null
         endReorder(revert = true)
         cancelFolderExit()
@@ -835,6 +852,126 @@ class DragController(
         folderDrag?.cancel() ?: animateBackground(0f, 150)
         folderDrag = null
         cleanup()
+    }
+
+    // ---- drag guides (design opinion 9) ----
+
+    private val guideRect = RectF()
+    private var guideDots = FloatArray(0)
+    private var dotsKey = ""
+
+    /** The guides view, added under the drag view when first needed. */
+    private fun guidesView(): DragGuides {
+        guides?.let { return it }
+        val g = DragGuides(context, dpProvider())
+        val at = dragView?.let { overlay.indexOfChild(it) }?.takeIf { it >= 0 } ?: overlay.childCount
+        overlay.addView(g, at, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        guides = g
+        return g
+    }
+
+    private fun hideGuides() {
+        val g = guides ?: return
+        g.dots(null, guideDots, 0)
+        g.outline(null, null, DragGuides.Kind.ICON)
+        dotsKey = ""
+    }
+
+    /** Dropped or cancelled: the guides fade out (in their own time, the rebind doesn't cut them off). */
+    private fun fadeGuides() {
+        val g = guides ?: return
+        guides = null; lastTarget = null; dotsKey = ""
+        g.onGone = { overlay.removeView(g) }
+        g.fadeOut()
+    }
+
+    /**
+     * Dots on the free cells of the page under the drag, and the outline on [t]'s spot: a Home cell (icon-sized, in
+     * the icon's shape, where the icon sits in its cell), the dock slot it would take, or the widget's span. No
+     * outline over a folder target (its plate shows instead), over Remove, or with nowhere to go.
+     */
+    private fun updateGuides(t: Target?) {
+        lastTarget = t
+        val m = model() ?: return
+        val dp = dpProvider()
+        val g = guidesView()
+        val page = workspace().currentPage
+        val cl = workspace().pageAt(page) as? CellLayout
+        // dots: only recounted when the page or the cells taken change
+        val key = "$page:${shownKey}:${m.items.size}:${cl?.width}"
+        if (key != dotsKey && cl != null && cl.cellW > 0) {
+            dotsKey = key
+            val cols = cl.cols; val rows = cl.rows
+            val taken = BooleanArray(cols * rows)
+            for (it in m.items) {
+                if (it === item || it.container != Container.WORKSPACE || it.screen != page) continue
+                val p = shownPushes[it]
+                val ix = p?.first ?: it.x; val iy = p?.second ?: it.y
+                for (yy in iy.coerceAtLeast(0) until minOf(rows, iy + it.spanY)) for (xx in ix.coerceAtLeast(0) until minOf(cols, ix + it.spanX)) taken[yy * cols + xx] = true
+            }
+            if (guideDots.size < cols * rows * 2) guideDots = FloatArray(cols * rows * 2)
+            val cy0 = iconCentreInCell(cl)
+            var n = 0
+            for (yy in 0 until rows) for (xx in 0 until cols) {
+                if (taken[yy * cols + xx]) continue
+                guideDots[n * 2] = cl.cellLeft(xx) + cl.cellW / 2f
+                guideDots[n * 2 + 1] = cl.cellTop(yy) + cy0
+                n++
+            }
+            g.dots(cl, guideDots, n)
+        }
+        // outline
+        if (t == null || t.mergeWith != null) { g.outline(null, null, DragGuides.Kind.ICON); return }
+        if (t.container == Container.HOTSEAT) {
+            val hs = hotseat()
+            val count = m.items.count { it.container == Container.HOTSEAT && it !== item }
+            val slotW = (hs.width - hs.paddingLeft - hs.paddingRight) / (count + 1f)
+            val cx = hs.paddingLeft + (t.x + 0.5f) * slotW
+            val cy = hs.paddingTop + (hs.height - hs.paddingTop - hs.paddingBottom) / 2f
+            val h = dp.iconSizePx / 2f
+            guideRect.set(cx - h, cy - h, cx + h, cy + h)
+            g.outline(hs, guideRect, DragGuides.Kind.ICON)
+            return
+        }
+        val tl = workspace().pageAt(t.screen) as? CellLayout ?: run { g.outline(null, null, DragGuides.Kind.ICON); return }
+        if (tl.cellW <= 0) return
+        val w = item as? HomeItem.Widget
+        if (w != null) {
+            val pad = dp.widgetPaddingPx.toFloat()
+            guideRect.set(tl.cellLeft(t.x) + pad, tl.cellTop(t.y) + pad, tl.cellLeft(t.x + w.sx) - pad, tl.cellTop(t.y + w.sy) - pad)
+            g.outline(tl, guideRect, DragGuides.Kind.WIDGET)
+            return
+        }
+        val sx = (item?.spanX ?: 1).coerceAtMost(tl.cols)
+        val sy = (item?.spanY ?: 1).coerceAtMost(tl.rows)
+        // a large folder's container: from one icon's left to the next column's icon's right
+        val side = (sx - 1) * tl.cellW + dp.iconSizePx
+        val labelH = tl.cellH - 2f * iconCentreInCell(tl)                       // (0 with labels off)
+        val l = tl.cellLeft(t.x) + (sx * tl.cellW - side) / 2f
+        val top = tl.cellTop(t.y) + (sy * tl.cellH - side - labelH) / 2f       // (IconView.iconTop)
+        guideRect.set(l, top, l + side, top + side)
+        g.outline(tl, guideRect, if (item is HomeItem.Folder) DragGuides.Kind.FOLDER else DragGuides.Kind.ICON)
+    }
+
+    /**
+     * How far down its cell an app icon's centre sits on Home (its icon+gap+label block is centred, IconView.iconTop):
+     * read off a 1×1 icon on [cl] or another page; the cell's middle if there's none.
+     */
+    private fun iconCentreInCell(cl: CellLayout): Float {
+        fun sample(g: CellLayout): Float? {
+            for (i in 0 until g.childCount) {
+                val v = g.getChildAt(i) as? IconView ?: continue
+                if (v is LargeFolderIconView || v.height <= 0) continue
+                val lp = v.layoutParams as? CellLayout.LayoutParams ?: continue
+                if (lp.spanX != 1 || lp.spanY != 1) continue
+                return v.iconTop() + v.iconSizePx() / 2f
+            }
+            return null
+        }
+        sample(cl)?.let { return it }
+        val ws = workspace()
+        for (p in 0 until ws.pageCount) (ws.pageAt(p) as? CellLayout)?.takeIf { it !== cl }?.let { o -> sample(o)?.let { return it } }
+        return cl.cellH / 2f
     }
 
     private fun cleanup() {

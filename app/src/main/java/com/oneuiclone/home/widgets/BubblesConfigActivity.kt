@@ -206,7 +206,8 @@ class BubblesConfigActivity : OneUiPage() {
         private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 2f * d }
         private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = primary }
         private val digits = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xFFFFFFFF.toInt(); textAlign = Paint.Align.CENTER; textSize = 14f * resources.displayMetrics.scaledDensity
+            // the accent follows the wallpaper palette: a light one (dark mode) takes dark digits
+            color = if (android.graphics.Color.luminance(primary) > 0.5f) 0xFF1A1A1A.toInt() else 0xFFFFFFFF.toInt(); textAlign = Paint.Align.CENTER; textSize = 14f * resources.displayMetrics.scaledDensity
             typeface = Fonts.ui(context, 600)
         }
 

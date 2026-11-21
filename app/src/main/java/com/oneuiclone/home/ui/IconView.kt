@@ -59,6 +59,19 @@ open class IconView(context: Context, protected val dp: DeviceProfile) : View(co
     var badgeCount = 0
         set(v) { if (field != v) { field = v; invalidate() } }
     var badgeNumber = true
+        set(v) { if (field != v) { field = v; invalidate() } }
+    /**
+     * Badge look (Prefs.badgeStyle, design opinion 5): One UI's orange, the cream pill with the number in a deep shade
+     * of the Icon colour (default), or a quiet cream dot. Set where badges are applied (Launcher.applyBadge).
+     */
+    var badgeStyle = com.oneuiclone.home.settings.Prefs.BADGE_MATCHED
+        set(v) { if (field != v) { field = v; invalidate() } }
+    /**
+     * Labels off, "While touching" (design opinion 3): 0..1, the label fades in under the icon while a finger is on
+     * Home. Drawn only when [showLabel] is false; it doesn't move the icon ([iconTop] ignores it).
+     */
+    var peekLabel = 0f
+        set(v) { val c = v.coerceIn(0f, 1f); if (field != c) { field = c; invalidate() } }
     /** One UI "white background" mode (WhiteBgColorUpdater): dark labels without shadow on bright wallpapers. */
     var darkText = false
         set(v) {
@@ -71,6 +84,7 @@ open class IconView(context: Context, protected val dp: DeviceProfile) : View(co
         }
 
     protected open val iconSize get() = dp.iconSizePx
+    protected open val iconHeight get() = iconSize
     /** Last touch-down point inside this view (for multi-target items like large folders). */
     var lastTouchX = 0f; var lastTouchY = 0f
 
@@ -97,14 +111,14 @@ open class IconView(context: Context, protected val dp: DeviceProfile) : View(co
     }
 
     /** Top of the icon inside this view: icon+gap+label block is centred vertically. */
-    fun iconTop(): Int {
+    open fun iconTop(): Int {
         val fm = textPaint.fontMetrics
         val labelH = if (showLabel) (fm.descent - fm.ascent) + dp.iconLabelGapPx else 0f
-        val block = iconSize + labelH
+        val block = iconHeight + labelH
         return ((height - block) / 2f).toInt().coerceAtLeast(0)
     }
 
-    fun iconLeft(): Int = (width - iconSize) / 2
+    open fun iconLeft(): Int = (width - iconSize) / 2
 
     /** Icon bounds in window coordinates; [part] (in icon coordinates) narrows them, e.g. to a large-folder slot. */
     fun iconBoundsOnScreen(out: Rect, part: Rect? = null) {
@@ -113,7 +127,7 @@ open class IconView(context: Context, protected val dp: DeviceProfile) : View(co
         val sx = scaleXOnScreen()
         val l = loc[0] + (iconLeft() + (part?.left ?: 0)) * sx
         val t = loc[1] + (iconTop() + (part?.top ?: 0)) * sx
-        out.set(l.toInt(), t.toInt(), (l + (part?.width() ?: iconSize) * sx).toInt(), (t + (part?.height() ?: iconSize) * sx).toInt())
+        out.set(l.toInt(), t.toInt(), (l + (part?.width() ?: iconSize) * sx).toInt(), (t + (part?.height() ?: iconHeight) * sx).toInt())
     }
 
     private fun scaleXOnScreen(): Float {
@@ -134,6 +148,7 @@ open class IconView(context: Context, protected val dp: DeviceProfile) : View(co
     }
 
     fun iconSizePx(): Int = iconSize
+    fun iconHeightPx(): Int = iconHeight
 
     /** One UI shrinks letter spacing (−0.4 → −0.7 steps) before ellipsizing long labels. */
     private fun fitLabel() {
@@ -155,18 +170,32 @@ open class IconView(context: Context, protected val dp: DeviceProfile) : View(co
             drawIcon(canvas, left, top); drawBadge(canvas, left, top)
             if (faded) canvas.restore()
         }
-        if (showLabel && labelAlpha > 0f) {
+        val la = if (showLabel) labelAlpha else peekLabel * labelAlpha
+        if (la > 0f) {
             if (drawnLabel.isEmpty() && label.isNotEmpty()) fitLabel()
             val fm = textPaint.fontMetrics
-            val baseline = top + iconSize + dp.iconLabelGapPx - fm.ascent
-            textPaint.alpha = (255 * labelAlpha).toInt()
-            // A translucent shadow colour ignores the paint's alpha, so a fading label showed as its
-            // full dark shadow under faint text (dark labels at the start of a folder open): fade it too.
-            if (!darkText) {
-                val sa = (0x59 * labelAlpha).toInt()
-                if (sa != shadowAlpha) { shadowAlpha = sa; textPaint.setShadowLayer(dp.dp(2f), 0f, 0f, sa shl 24) }
+            val baseline = top + iconHeight + dp.iconLabelGapPx - fm.ascent
+            val overrideDark = if (GlassPaint.overrideActive) GlassPaint.overrideDarkText else null
+            if (overrideDark != null && overrideDark != darkText) {
+                val prevColor = textPaint.color
+                val prevAlpha = textPaint.alpha
+                textPaint.color = if (overrideDark) 0xFF1D1D1F.toInt() else 0xFFFAFAFA.toInt()
+                textPaint.alpha = (255 * la).toInt()
+                if (overrideDark) textPaint.clearShadowLayer() else textPaint.setShadowLayer(dp.dp(2f), 0f, 0f, (0x59 * la).toInt() shl 24)
+                canvas.drawText(drawnLabel, 0, drawnLabel.length, width / 2f, baseline, textPaint)
+                textPaint.color = prevColor
+                textPaint.alpha = prevAlpha
+                if (darkText) textPaint.clearShadowLayer() else textPaint.setShadowLayer(dp.dp(2f), 0f, 0f, shadowAlpha shl 24)
+            } else {
+                textPaint.alpha = (255 * la).toInt()
+                // A translucent shadow colour ignores the paint's alpha, so a fading label showed as its
+                // full dark shadow under faint text (dark labels at the start of a folder open): fade it too.
+                if (!darkText) {
+                    val sa = (0x59 * la).toInt()
+                    if (sa != shadowAlpha) { shadowAlpha = sa; textPaint.setShadowLayer(dp.dp(2f), 0f, 0f, sa shl 24) }
+                }
+                canvas.drawText(drawnLabel, 0, drawnLabel.length, width / 2f, baseline, textPaint)
             }
-            canvas.drawText(drawnLabel, 0, drawnLabel.length, width / 2f, baseline, textPaint)
         }
     }
 
@@ -174,6 +203,7 @@ open class IconView(context: Context, protected val dp: DeviceProfile) : View(co
         color = 0xFFF54D13.toInt()                                          // badge_bg_color
         setShadowLayer(dp.dp(1f), 0f, 0f, 0x33000000)                      // BADGE_SHADOW
     }
+    private val badgeRing = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val badgeText = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0xFFFCFCFC.toInt()                                          // badge_number_color
         textAlign = Paint.Align.CENTER
@@ -188,6 +218,22 @@ open class IconView(context: Context, protected val dp: DeviceProfile) : View(co
     private fun drawBadge(canvas: Canvas, left: Int, top: Int) {
         if (badgeCount <= 0) return
         val s = iconSize.toFloat()
+        val orange = badgeStyle == com.oneuiclone.home.settings.Prefs.BADGE_ORANGE
+        if (orange) { badgePaint.color = BADGE_ORANGE_BG; badgePaint.setShadowLayer(dp.dp(1f), 0f, 0f, 0x33000000); badgeText.color = 0xFFFCFCFC.toInt() }
+        else {
+            badgePaint.color = BADGE_CREAM
+            badgePaint.setShadowLayer(dp.dp(3f), 0f, dp.dp(1.2f), 0x4D000000)        // mockup: 0 3px 9px rgba(0,0,0,.3)
+            badgeText.color = deepShade(context)
+        }
+        if (!orange && (!badgeNumber || badgeStyle == com.oneuiclone.home.settings.Prefs.BADGE_QUIET)) {
+            // Quiet (or numbers off): a cream dot with a ring in the deep shade, a fifth of the icon, at its top right
+            val r = s * 0.1f
+            val cx = left + s * 0.8f; val cy = top + s * 0.2f
+            canvas.drawCircle(cx, cy, r, badgePaint)
+            badgeRing.color = badgeText.color; badgeRing.strokeWidth = s * 0.028f
+            canvas.drawCircle(cx, cy, r - badgeRing.strokeWidth / 2f, badgeRing)
+            return
+        }
         if (!badgeNumber) {
             val r = s * 0.06f
             canvas.drawCircle(left + s - r, top + r, r, badgePaint)
@@ -195,9 +241,10 @@ open class IconView(context: Context, protected val dp: DeviceProfile) : View(co
         }
         val pullIn = if (top < s * 0.137f / 2f) 0.05f else 0f
         val cy = top + s * (0.5f - 0.3965f + pullIn)
-        val d = s * 0.327f
+        val d = s * (if (orange) 0.327f else 0.345f)
         val txt = if (badgeCount > 999) "999+" else badgeCount.toString()
         badgeText.textSize = if (s > dp.dp(48f)) dp.dp(12f) else dp.dp(9f)
+        badgeText.typeface = Fonts.ui(context, if (orange) 600 else 700)
         val pad = dp.dp(2f)
         val (cx, w) = when {
             badgeCount < 10 -> s * (0.5f + 0.3965f - pullIn) to d
@@ -208,6 +255,13 @@ open class IconView(context: Context, protected val dp: DeviceProfile) : View(co
         val half = maxOf(w, badgeText.measureText(txt) + 2 * pad) / 2f
         val r = android.graphics.RectF(left + cx - half, cy - d / 2f, left + cx + half, cy + d / 2f)
         canvas.drawRoundRect(r, d / 2f, d / 2f, badgePaint)
+        if (!orange) {
+            // a hairline warm rim so the cream reads on light glass too (mockup: inset 1.5px rgba(90,45,20,.14))
+            badgeRing.color = 0x245A2D14; badgeRing.strokeWidth = dp.dp(0.6f)
+            val h = badgeRing.strokeWidth / 2f
+            r.inset(h, h)
+            canvas.drawRoundRect(r, d / 2f - h, d / 2f - h, badgeRing)
+        }
         val fm = badgeText.fontMetrics
         canvas.drawText(txt, r.centerX(), r.centerY() - (fm.ascent + fm.descent) / 2f, badgeText)
     }
@@ -223,7 +277,8 @@ open class IconView(context: Context, protected val dp: DeviceProfile) : View(co
     private val folderBgRim = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; color = 0x24000000 }
 
     protected open fun drawIcon(canvas: Canvas, left: Int, top: Int) {
-        val b = icon ?: return
+        val b = (if (GlassPaint.overrideActive) (item as? HomeItem.App)?.let { GlassPaint.overrideIcons?.get(it.key) } else null)
+            ?: icon ?: return
         dst.set(left, top, left + iconSize, top + iconSize)
         if (folderBgScale > 1f) {
             if (hoverPathSize != iconSize) { hoverPath = com.oneuiclone.home.icons.IconShape.path(iconSize.toFloat(), com.oneuiclone.home.icons.IconShape.container); hoverPathSize = iconSize }
@@ -334,6 +389,27 @@ open class IconView(context: Context, protected val dp: DeviceProfile) : View(co
     }
 
     companion object {
+        private const val BADGE_ORANGE_BG = 0xFFF54D13.toInt()
+        /** Matched / Quiet badges: the mockup's cream (#FFF7F0). */
+        private const val BADGE_CREAM = 0xFFFFF7F0.toInt()
+        private var deepFrom = 0
+        private var deep = 0xFF4A2A1B.toInt()
+
+        /**
+         * The Matched badge's number: the Icon colour (Prefs.themeColor, else the colour palette's accent, as the icons
+         * use) at the same hue, saturation at most 0.6, lightness 0.2 (the mockup's DEEP). Cached per accent.
+         */
+        fun deepShade(context: Context): Int {
+            val a = com.oneuiclone.home.icons.IconFactory.themeAccent(context)
+            if (a != deepFrom) {
+                val hsl = FloatArray(3)
+                androidx.core.graphics.ColorUtils.colorToHSL(a, hsl)
+                hsl[1] = minOf(0.6f, hsl[1]); hsl[2] = 0.2f
+                deep = androidx.core.graphics.ColorUtils.HSLToColor(hsl); deepFrom = a
+            }
+            return deep
+        }
+
         /**
          * How far above its cell's centre a labelled Home icon's centre sits: half its label and gap, as
          * [iconTop] centres the icon+gap+label block. A widget set to Align with icons rises by this much.

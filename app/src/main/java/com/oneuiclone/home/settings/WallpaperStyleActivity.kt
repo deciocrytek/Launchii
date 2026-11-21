@@ -1,5 +1,6 @@
 package com.oneuiclone.home.settings
 
+import android.app.AlertDialog
 import android.app.WallpaperManager
 import android.content.Context
 import android.content.Intent
@@ -61,8 +62,13 @@ class WallpaperStyleActivity : OneUiPage() {
     /** Lays the page out once; every resume re-reads the wallpapers (one may have just been set). */
     override fun build() {
         if (!built) { built = true; layout() }
+        refreshLive()
         preview.load { lockCard.bitmap = preview.renderLock(cardWidth()); refreshHome() }
     }
+
+    /** Shows Live wallpaper's state and whether blur and zoom can use the wallpaper (back from the picker, or a wallpaper set). */
+    private var refreshLive: () -> Unit = {}
+
 
     private fun refreshHome() = preview.render(StylePreview.Look.of(prefs), cardWidth(), cardWidth()) { home, _ -> homeCard.bitmap = home }
 
@@ -70,7 +76,7 @@ class WallpaperStyleActivity : OneUiPage() {
     private fun layout() {
         list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12f), 0, dp(12f), dp(24f)) }
 
-        appBar("Wallpaper and style")
+        appBar("Wallpaper")
 
         // the two previews, lock screen first
         val ratio = preview.height / preview.width.toFloat()
@@ -78,15 +84,43 @@ class WallpaperStyleActivity : OneUiPage() {
         lockCard = PreviewCard(this, dp(18f).toFloat(), cardColor).apply { contentDescription = "Lock screen preview" }
         homeCard = PreviewCard(this, dp(18f).toFloat(), cardColor).apply { contentDescription = "Home screen preview" }
         val h = (cardWidth() * ratio).toInt()
-        previews.addView(lockCard, LinearLayout.LayoutParams(0, h, 1f).apply { marginEnd = dp(8f) })
-        previews.addView(homeCard, LinearLayout.LayoutParams(0, h, 1f).apply { marginStart = dp(8f) })
+        for ((i, pair) in listOf(lockCard to "Lock screen", homeCard to "Home screen").withIndex()) {
+            val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            col.addView(pair.first, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, h))
+            col.addView(TextView(this).apply {
+                text = pair.second; setTextColor(sub); setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 13f)
+                typeface = com.oneuiclone.home.ui.Fonts.ui(this@WallpaperStyleActivity, 400)
+                gravity = android.view.Gravity.CENTER; setPadding(0, dp(8f), 0, 0)
+            })
+            previews.addView(col, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { if (i == 0) marginEnd = dp(8f) else marginStart = dp(8f) })
+        }
         for (c in listOf(lockCard, homeCard)) c.setOnClickListener { pickPhoto() }
         list.addView(previews, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            bottomMargin = dp(28f)
+            bottomMargin = dp(20f)
         })
 
+        // Change wallpaper: a photo, positioned and set on Home, Lock screen or both (WallpaperActivity)
+        val change = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = android.view.Gravity.CENTER
+            background = android.graphics.drawable.RippleDrawable(android.content.res.ColorStateList.valueOf(0x33FFFFFF),
+                android.graphics.drawable.GradientDrawable().apply { cornerRadius = 100f * d; setColor(primary) }, null)
+            contentDescription = "Change wallpaper"
+            setOnClickListener { pickPhoto() }
+        }
+        change.addView(android.widget.ImageView(this).apply { setImageDrawable(GlyphDrawable(Glyphs.IMAGE, onPrimary, dp(22f))) },
+            LinearLayout.LayoutParams(dp(22f), dp(22f)).apply { marginEnd = dp(10f) })
+        change.addView(TextView(this).apply {
+            text = "Change wallpaper"; setTextColor(onPrimary); setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 17f)
+            typeface = com.oneuiclone.home.ui.Fonts.ui(this@WallpaperStyleActivity, 600)
+        })
+        list.addView(change, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56f)).apply {
+            marginStart = dp(4f); marginEnd = dp(4f); bottomMargin = dp(16f)
+        })
+        register("Change wallpaper", change)
+        caption("Pick a photo, move and zoom it, then set it on Home, Lock screen or both. Tapping either preview does the same.")
+
+        groupHeader("Effects")
         card {
-            row("Change wallpapers", null, primary, null, { pickPhoto() }, titleWeight = 600)
             var strength: SeekBar? = null
             lateinit var blurRow: LinearLayout
             val blurSummary = "Soften the wallpaper behind your Home screen. Your lock screen stays as it is."
@@ -115,9 +149,11 @@ class WallpaperStyleActivity : OneUiPage() {
                 if (prefs.homeBlur) applyBlur()
             }
             strength.isEnabled = prefs.homeBlur
+            liveWallpaperRow()
         }
+        groupHeader("Colours")
         card {
-            row("Colour palette", "Choose a palette based on colours from your wallpaper.", sub,
+            row("Colour palette", "Choose a palette based on colours from your wallpaper. Settings takes its accent from it.", sub,
                 Swatch(this@WallpaperStyleActivity).apply { layoutParams = LinearLayout.LayoutParams(dp(34f), dp(56f)).apply { marginStart = dp(16f) } },
                 { openColours() }, titleWeight = 600)
         }
@@ -135,6 +171,81 @@ class WallpaperStyleActivity : OneUiPage() {
             insets
         }
         setContentView(root)
+    }
+
+    /**
+     * Launchii's live wallpaper (Settings' row before 0.263, now a switch): the same picture, drawn by Launchii so Home
+     * can zoom the real wallpaper on app opens and closes. Wallpapers set in Launchii go on as it until it's turned off
+     * here (after a confirm), which puts the picture back as a normal image wallpaper. Under it, whether blur and zoom
+     * can use the wallpaper (Settings' Wallpaper effects row).
+     */
+    private fun liveWallpaperRow() {
+        val lw = com.oneuiclone.home.ui.LiveWallpaper
+        val app = getString(com.oneuiclone.home.R.string.app_name)
+        var syncing = false
+        lateinit var sw: Switch
+        lateinit var summary: TextView
+        val r = toggle("Live wallpaper", "", false) { on ->
+            if (syncing) return@toggle
+            val live = lw.isActive(this)
+            val hasCopy = com.oneuiclone.home.ui.WallpaperLayer.hasOwnCopy(this)
+            when {
+                live && !on -> AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                    .setTitle("Turn off live wallpaper?")
+                    .setMessage("Your wallpaper stays the same picture, as a normal wallpaper, and it won't zoom when apps open and close.")
+                    // the switch stays off while it's turned off; cancelled, it goes back on
+                    .setNegativeButton(android.R.string.cancel) { _, _ -> refreshLive() }
+                    .setOnCancelListener { refreshLive() }
+                    .setPositiveButton("Turn off") { _, _ ->
+                        val ctx = applicationContext
+                        lw.setWanted(ctx, false)
+                        Thread {
+                            val ok = try { lw.turnOff(ctx) } catch (_: Exception) { false }
+                            runOnUiThread {
+                                if (!ok) Toast.makeText(ctx, "Couldn't turn it off", Toast.LENGTH_SHORT).show()
+                                if (!isDestroyed) refreshLive()
+                            }
+                        }.start()
+                    }
+                    .show()
+                !live && on && hasCopy -> try {
+                    lw.setWanted(this, true)
+                    // the picker's outcome shows once we're back (build runs on resume)
+                    startActivity(lw.pickerIntent(this))
+                } catch (_: android.content.ActivityNotFoundException) {
+                    Toast.makeText(this, "This phone has no live wallpaper picker", Toast.LENGTH_SHORT).show()
+                    refreshLive()
+                }
+                else -> refreshLive()
+            }
+        }
+        sw = r.getChildAt(r.childCount - 1) as Switch
+        summary = (r.getChildAt(0) as LinearLayout).getChildAt(1) as TextView
+        // Wallpaper effects: a status line
+        val status = row("", null, sub, null, null).apply { setPadding(dp(18f), dp(4f), dp(20f), dp(16f)); minimumHeight = 0 }
+        val statusTitle = (status.getChildAt(0) as LinearLayout).getChildAt(0) as TextView
+        statusTitle.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14f)
+        val statusIcon = android.widget.ImageView(this)
+        status.addView(statusIcon, 0, LinearLayout.LayoutParams(dp(22f), dp(22f)).apply { marginEnd = dp(12f) })
+        register("Wallpaper effects", status)
+        refreshLive = {
+            val live = lw.isActive(this)
+            val hasCopy = com.oneuiclone.home.ui.WallpaperLayer.hasOwnCopy(this)
+            syncing = true
+            sw.isChecked = live
+            syncing = false
+            sw.isEnabled = live || hasCopy
+            r.isClickable = live || hasCopy
+            summary.text = when {
+                live -> "On: your wallpaper zooms when apps open and close. Aura, Shutter and the other wallpaper openings need it."
+                hasCopy -> "Off. Turn it on so your wallpaper zooms when apps open and close."
+                else -> "Set a wallpaper from $app, as above, and it zooms when apps open and close"
+            }
+            statusTitle.text = if (hasCopy) "Blur and zoom use your wallpaper"
+                else "For blur and zoom, set your wallpaper with Change wallpaper, or with Set as wallpaper in your photos app"
+            statusTitle.setTextColor(if (hasCopy) text else primary)
+            statusIcon.setImageDrawable(GlyphDrawable(if (hasCopy) Glyphs.CHECK else Glyphs.INFO, primary, dp(20f)))
+        }
     }
 
     private fun pickPhoto() {

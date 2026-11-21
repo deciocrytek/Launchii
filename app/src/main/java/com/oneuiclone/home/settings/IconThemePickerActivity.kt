@@ -54,7 +54,7 @@ class IconThemePickerActivity : OneUiPage() {
     private fun refreshDock() = preview.render(StylePreview.Look.of(prefs), stripWidth() / 3, stripWidth()) { _, dock -> dockStrip.bitmap = dock }
 
     private fun select(s: Int) {
-        val ring = if (night) 0xFF3E91FF.toInt() else primary
+        val ring = primary
         for ((i, v) in cards) {
             (v.background as GradientDrawable).setStroke(dp(2f), if (i == s) ring else android.graphics.Color.TRANSPARENT)
             v.findViewWithTag<View>("check").visibility = if (i == s) View.VISIBLE else View.GONE
@@ -87,7 +87,7 @@ class IconThemePickerActivity : OneUiPage() {
             for (pair in styles.chunked(2)) {
                 val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
                 pair.forEachIndexed { k, s ->
-                    row.addView(themeCard(s), LinearLayout.LayoutParams(cardWidth(), ViewGroup.LayoutParams.MATCH_PARENT).apply {
+                    row.addView(themeCard(s).also { register(IconThemeActivity.STYLES[s], it) }, LinearLayout.LayoutParams(cardWidth(), ViewGroup.LayoutParams.MATCH_PARENT).apply {
                         if (k == 1) marginStart = dp(GAP)
                     })
                 }
@@ -117,7 +117,7 @@ class IconThemePickerActivity : OneUiPage() {
         val check = TextView(this).apply {
             tag = "check"
             text = "✓"; gravity = Gravity.CENTER
-            setTextColor(android.graphics.Color.WHITE); setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(onPrimary); setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             typeface = Fonts.ui(this@IconThemePickerActivity, 700)
             background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(primary) }
             visibility = View.GONE

@@ -84,6 +84,8 @@ open class FolderIconView(context: Context, dp: DeviceProfile) : IconView(contex
 
     var previews: List<Bitmap> = emptyList()
         set(v) { field = v; invalidate() }
+    /** Matching app keys for [previews], used when opaque themed folders re-tint in Recent wallpapers previews. */
+    var previewKeys: List<com.oneuiclone.home.model.AppKey> = emptyList()
     var bgColor = DEFAULT_BG
         set(v) { field = v; fillPaint.color = v; invalidate() }
     /** 0..1 — used when the folder is opening (preview hidden while icons fly). */
@@ -161,7 +163,7 @@ open class FolderIconView(context: Context, dp: DeviceProfile) : IconView(contex
      * (AppInfo.previewIcon), show the folder's own glass and colour there, all one shape, rather than the wallpaper
      * sharp through them (user, 0.235/0.238; 0.234's own glass under each app looked worse).
      */
-    protected fun drawContainer(canvas: Canvas, left: Int, top: Int) {
+    protected open fun drawContainer(canvas: Canvas, left: Int, top: Int) {
         val path = outline(folderBgScale * plateScale)
         // no contour: 0.246 gave folders the icons' emboss with Icon contour on; the user wanted none (0.247)
         drawnAt.reset(); transformMatrixToGlobal(drawnAt)
@@ -171,8 +173,13 @@ open class FolderIconView(context: Context, dp: DeviceProfile) : IconView(contex
             glassPaint.paint.alpha = (255 * containerAlpha).toInt()
             canvas.drawPath(path, glassPaint.paint)
         }
-        fillPaint.alpha = (android.graphics.Color.alpha(bgColor) * containerAlpha * fillOpacity).toInt()
+        val tint = if (GlassPaint.overrideActive && GlassPaint.overrideFolderTint != 0 &&
+            (item as? com.oneuiclone.home.model.HomeItem.Folder)?.color == 0 && glass != null) GlassPaint.overrideFolderTint else bgColor
+        val prevColor = fillPaint.color
+        if (tint != prevColor) fillPaint.color = tint
+        fillPaint.alpha = (android.graphics.Color.alpha(tint) * containerAlpha * fillOpacity).toInt()
         canvas.drawPath(path, fillPaint)
+        if (tint != prevColor) fillPaint.color = prevColor
     }
 
     private val outlinePath = Path()
@@ -284,7 +291,10 @@ open class FolderIconView(context: Context, dp: DeviceProfile) : IconView(contex
             bmpPaint.alpha = (255 * previewAlpha).toInt()
             for (i in 0 until minOf(previewSlots, previews.size)) {
                 if (i in hiddenPreviews) continue
-                val b = previews.getOrNull(rankInSlot(i)) ?: continue
+                val rank = rankInSlot(i)
+                val b = (if (GlassPaint.overrideActive && GlassPaint.overrideFolderTint == 0) {
+                    previewKeys.getOrNull(rank)?.let { GlassPaint.overrideIcons?.get(it) }
+                } else null) ?: previews.getOrNull(rank) ?: continue
                 childRect(i, dst)
                 drawPreview(canvas, b, dst, left, top)
             }
@@ -300,7 +310,7 @@ open class FolderIconView(context: Context, dp: DeviceProfile) : IconView(contex
     fun iconRectOnScreen(out: Rect) = iconBoundsOnScreen(out)
 
     /** While set (by [renderIcon]): icon → window for the glass, in place of where the icon is drawn now. */
-    private var glassFixed: Matrix? = null
+    protected var glassFixed: Matrix? = null
 
     /**
      * The folder icon as drawn, for the surface an app closes into. [atRest] is the icon's rect in the window once
@@ -309,9 +319,11 @@ open class FolderIconView(context: Context, dp: DeviceProfile) : IconView(contex
      * part of the wallpaper and snapped to the real one when the icon took over on landing (recording 6937).
      */
     fun renderIcon(atRest: Rect? = null): Bitmap {
-        val b = Bitmap.createBitmap(iconSize, iconSize, Bitmap.Config.ARGB_8888)
+        val w = iconSize
+        val h = iconHeight
+        val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         glassFixed = atRest?.let { r ->
-            Matrix().apply { setScale(r.width() / iconSize.toFloat(), r.height() / iconSize.toFloat()); postTranslate(r.left.toFloat(), r.top.toFloat()) }
+            Matrix().apply { setScale(r.width() / w.toFloat(), r.height() / h.toFloat()); postTranslate(r.left.toFloat(), r.top.toFloat()) }
         }
         try { drawIcon(Canvas(b), 0, 0) } finally { glassFixed = null }
         return b

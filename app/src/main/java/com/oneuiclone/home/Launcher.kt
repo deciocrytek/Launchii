@@ -6,6 +6,7 @@ import android.content.pm.LauncherApps
 import android.graphics.Rect
 import android.graphics.RectF
 import android.os.Process
+import android.os.SystemClock
 import android.view.MotionEvent
 import android.view.VelocityTracker
 import android.view.View
@@ -18,6 +19,7 @@ import com.oneuiclone.home.debug.AnimLog
 import com.oneuiclone.home.device.DeviceProfile
 import com.oneuiclone.home.icons.IconFactory
 import com.oneuiclone.home.model.AppInfo
+import com.oneuiclone.home.model.AppKey
 import com.oneuiclone.home.model.AppRepository
 import com.oneuiclone.home.model.Container
 import com.oneuiclone.home.model.HomeItem
@@ -39,6 +41,7 @@ import androidx.dynamicanimation.animation.SpringAnimation
 import androidx.dynamicanimation.animation.SpringForce
 import kotlin.math.abs
 import kotlin.math.exp
+import kotlin.math.sqrt
 
 /**
  * Whether app closes zoom the launcher's wallpaper copy out. Off: they leave the real wallpaper to the system, as they
@@ -148,9 +151,29 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         private const val LIFT_COMMIT = 0.3f
         /** How long Home may stay resumed after losing the top spot before that counts as the nav-bar swipe up. */
         private const val NAV_SWIPE_CHECK_MS = 120L
+        /** Glide: the finger must rest this long after the long-press buzz before sliding onto the menu picks. */
+        private const val GLIDE_SETTLE_MS = 250L
+        /** Settings › Folders & widgets › Add a widget: Home opens its widget list. */
+        const val EXTRA_OPEN_WIDGETS = "app.launchii.OPEN_WIDGETS"
+        /** The wallpaper starts this far in; icons ripple out from here (the under-display fingerprint sensor). */
+        private const val UNLOCK_ZOOM = 1.06f
+        private const val UNLOCK_SENSOR_Y = 0.84f
+        /** 0.264: all three 1.2× the 0.262 lengths (user: "a tad slower"); 0.276: 1.15× again (900, 312, 504 before). */
+        private const val UNLOCK_WALLPAPER_MS = 1035L
+        private const val UNLOCK_RIPPLE_MS = 359f
+        private const val UNLOCK_ICON_MS = 580L
+        /** A keyguard gone this long before Home shows was an unlock into something else (an app), not to Home. */
+        private const val UNLOCK_PRESENT_GRACE_MS = 2000L
         private const val LIFT_FLICK = 0.0012f
         private const val LIFT_BACK_FLICK = 0.0015f
         private const val LIFT_STIFFNESS = 420f
+        /**
+         * Fastest Lift-Off may advance while a finger drags it (progress/s), and fastest the release spring may start
+         * (progress/s): regular drags stay 1:1 with the finger, while a fast flick can't teleport most of the lift in
+         * 1–2 frames or slam through 1.0 into the clamp without playing the animation.
+         */
+        private const val LIFT_MAX_DRAG_RATE = 6f
+        private const val LIFT_MAX_SPRING_VELOCITY = 8f
         /** The bar's landing bounce: none below 0.0015 progress/ms, the full 8 dp from 0.01/ms. */
         private const val LIFT_BOUNCE_FROM = 0.0015f
         private const val LIFT_BOUNCE_RANGE = 0.0085f
@@ -187,6 +210,9 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
     /** Apps screen: one alphabetical grid that scrolls vertically. */
     lateinit var appsScroll: android.widget.ScrollView; private set
     private lateinit var appsGrid: CellLayout
+    /** The Apps screen's A–Z rail (null when turned off in Settings). */
+    private var letterRail: com.oneuiclone.home.ui.LetterRail? = null
+    private var railHooked = false
     lateinit var searchPill: SearchPill; private set
     /** One UI 9 Finder-style Search button left of the page dots. */
     lateinit var homeSearch: HomeSearchButton; private set
@@ -274,6 +300,81 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         },
     )
     private var popup: com.oneuiclone.home.ui.QuickOptionPopup? = null
+    // ---- Undo after a removal (0.263, design opinion 2) ----
+    private var undoPill: com.oneuiclone.home.ui.UndoPill? = null
+    /** A folder being dragged: its apps, so Undo can put the whole folder back if it's dropped on Remove. */
+    private var dragFolderApps: List<HomeItem.App> = emptyList()
+
+    /** After [item] left Home (and [inside], a folder's apps): the Undo pill above the dock for a few seconds. */
+    private fun offerUndo(item: HomeItem, inside: List<HomeItem.App>) {
+        if (item is HomeItem.Widget) return
+        val label = when (item) {
+            is HomeItem.App -> repo?.get(item.key)?.label?.toString() ?: "App"
+            is HomeItem.Folder -> item.title.ifBlank { "Folder" }
+            else -> return
+        }
+        undoPill?.hide(now = true)
+        lateinit var pill: com.oneuiclone.home.ui.UndoPill
+        pill = com.oneuiclone.home.ui.UndoPill(activity, dp, label, onUndo = { undoRemove(item, inside) }, onGone = { if (undoPill === pill) undoPill = null })
+        val h = dp.dpi(48f)
+        overlay.addView(pill, FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, h).apply {
+            gravity = android.view.Gravity.CENTER_HORIZONTAL
+            topMargin = dp.hotseatRect.top - h - dp.dpi(14f)
+        })
+        pill.show()
+        undoPill = pill
+    }
+
+    /** Puts [item] back where it was; if that spot was taken meanwhile, in the first free one (a new page if need be). */
+    private fun undoRemove(item: HomeItem, inside: List<HomeItem.App>) {
+        val m = model ?: return
+        if (m.items.any { it.id == item.id }) return
+        val dockTaken = item.container == Container.HOTSEAT && m.items.any { it !== item && it.container == Container.HOTSEAT && it.x == item.x }
+        val cellTaken = item.container == Container.WORKSPACE && m.isOccupied(item.screen, item.x, item.y, item.spanX, item.spanY)
+        if (dockTaken || cellTaken) {
+            item.container = Container.WORKSPACE
+            val spot = (0 until m.pageCount).firstNotNullOfOrNull { p -> m.findSpace(p, item.spanX, item.spanY, dp.homeCols, dp.homeRows)?.let { p to it } }
+            if (spot != null) { item.screen = spot.first; item.x = spot.second.first; item.y = spot.second.second }
+            else { m.pageCount++; item.screen = m.pageCount - 1; item.x = 0; item.y = 0 }
+        }
+        m.items += item
+        m.items += inside.filter { a -> m.items.none { it.id == a.id } }
+        m.save(); bindWorkspace()
+        AnimLog.log("undo: put back ${item.id}")
+    }
+
+    // ---- names while touching (0.263, design opinion 3) ----
+    private var peek = 0f
+    private var peekAnim: ValueAnimator? = null
+
+    /**
+     * Home labels › While touching: with labels off, the Home pages' app names fade in while a finger is down (after a
+     * beat, so a quick tap doesn't flash them) and out a moment after it lifts. The dock stays without names.
+     */
+    private fun peekLabels(down: Boolean) {
+        if (!::dp.isInitialized || prefs.homeLabels || !prefs.homeLabelsPeek) { if (peek > 0f) { peek = 0f; applyPeek() }; return }
+        val show = down && state.state == StateController.State.HOME && !edit.isActive && search == null && !folders.isOpen
+        val to = if (show) 1f else 0f
+        if (peek == to && peekAnim?.isRunning != true) return
+        peekAnim?.cancel()
+        peekAnim = ValueAnimator.ofFloat(peek, to).apply {
+            startDelay = if (show) 120 else 450
+            duration = if (show) 180 else 320
+            interpolator = Easing.STANDARD
+            addUpdateListener { peek = it.animatedValue as Float; applyPeek() }
+            start()
+        }
+    }
+
+    private fun applyPeek() {
+        for (i in 0 until workspace.pageCount) {
+            val g = workspace.pageAt(i) as? ViewGroup ?: continue
+            for (j in 0 until g.childCount) (g.getChildAt(j) as? IconView)?.peekLabel = peek
+        }
+    }
+
+    /** Hold an empty spot: recent wallpapers and shortcuts (0.263). */
+    private var homeMenu: com.oneuiclone.home.ui.HomeMenu? = null
     private val shortcutLoader = com.oneuiclone.home.ui.ShortcutLoader(activity, (52 * activity.resources.displayMetrics.density).toInt())
     val widgets = com.oneuiclone.home.widgets.WidgetManager(activity).also {
         it.onLaunch = { appWidgetId, sender, send -> launchFromWidget(appWidgetId, sender, send) }
@@ -326,6 +427,11 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             .show()
     }
     private var dragArmed: View? = null
+    /** The long-press finger has slid onto the quick option card: it picks a row instead of dragging. */
+    private var gliding = false
+    /** When the long-press fired, and whether this touch may glide (decided once, when the finger first moves). */
+    private var longPressAt = 0L
+    private var glideOk: Boolean? = null
     private var armX = 0f
     private var armY = 0f
     private var lastLaunchedApp: AppInfo? = null
@@ -347,8 +453,46 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
     /** A Bubbles widget's apps changed (its configuration saves every pick): redraw it. */
     private val bubblesListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> if (bound) bindWorkspace() }
 
+    // ---- unlock settle (0.262), declared before init, which registers the receiver ----
+    /**
+     * Set when the screen goes off or a screen saver starts (or Home is made while off or locked); the next time Home
+     * is in front after that, it settles in (once).
+     */
+    private var unlockArmed = false
+    /**
+     * A screen saver (dream) is up. It starts with the screen still on (a timeout while charging: in the car, on a
+     * dock), so there's no SCREEN_OFF, and Home stops looking as if an app covered it. DREAMING_STARTED comes first.
+     */
+    private var dreaming = false
+    /** When the keyguard last went (USER_PRESENT, uptime); 0 since the screen went off. */
+    private var presentAt = 0L
+    private val unlockReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(c: android.content.Context, i: Intent) {
+            when (i.action) {
+                Intent.ACTION_SCREEN_OFF -> { unlockArmed = true; presentAt = 0L }
+                Intent.ACTION_DREAMING_STARTED -> { dreaming = true; unlockArmed = true; presentAt = 0L }
+                Intent.ACTION_DREAMING_STOPPED -> dreaming = false
+                // the keyguard has gone: ~1 s after Home came up for it, or before Home shows (a trusted device, an
+                // instant dismiss), or for an app
+                Intent.ACTION_USER_PRESENT -> {
+                    presentAt = android.os.SystemClock.uptimeMillis()
+                    if (homeResumed) settleOnUnlock("user present")
+                }
+            }
+        }
+    }
+
     init {
         live = java.lang.ref.WeakReference(this)
+        drag.onRemoved = { offerUndo(it, dragFolderApps) }
+        // Exported: USER_PRESENT comes from SystemUI, which isn't the system uid, so a not-exported receiver never
+        // got it (0.262–0.272). All are protected broadcasts: only the system can send them.
+        activity.registerReceiver(unlockReceiver, android.content.IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF); addAction(Intent.ACTION_USER_PRESENT)
+            addAction(Intent.ACTION_DREAMING_STARTED); addAction(Intent.ACTION_DREAMING_STOPPED)
+        }, android.content.Context.RECEIVER_EXPORTED)
+        // made while the screen is off or locked (recreated overnight): the unlock still settles in
+        if (!awake()) unlockArmed = true
         com.oneuiclone.home.widgets.BubblesWidget.prefs(activity).registerOnSharedPreferenceChangeListener(bubblesListener)
         root.clipChildren = false
         root.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
@@ -488,10 +632,10 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             override fun onScrollProgress(position: Float) = edit.onWorkspaceScroll()
         }
         edit.reset()
-        workspace.onEmptyLongPress = { _, _ ->
-            if (!edit.isActive && state.state == StateController.State.HOME && !folders.isOpen) {
+        workspace.onEmptyLongPress = { x, y ->
+            if (!edit.isActive && state.state == StateController.State.HOME && !folders.isOpen && homeMenu == null) {
                 workspace.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
-                edit.enter()
+                showHomeMenu(x, y)
             }
         }
         workspace.onEmptyTap = { x, _ ->
@@ -524,6 +668,24 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         appsLayer.addView(appsScroll, FrameLayout.LayoutParams(MATCH_PARENT, dp.searchBarTop - dp.dpi(8f) - listTop).apply {
             topMargin = listTop
         })
+        letterRail = if (!prefs.appsLetterRail) null else com.oneuiclone.home.ui.LetterRail(activity, dp).also { rail ->
+            // the lower part of the list, where a thumb reaches; letters stack up from just above the search pill
+            val bottom = dp.searchBarTop - dp.dpi(14f)
+            val top = listTop + (dp.searchBarTop - listTop) * 0.3f
+            appsLayer.addView(rail, FrameLayout.LayoutParams(dp.dpi(150f), (bottom - top).toInt()).apply {
+                gravity = android.view.Gravity.END; topMargin = top.toInt()
+            })
+            rail.enabledNow = { state.state == StateController.State.APPS && !state.isTransitioning && search == null && appsScroll.alpha > 0.5f }
+            rail.onLetter = { i -> scrollAppsTo(i) }
+        }
+        // the rail shows and hides with the list (search fades the list, not the layer); hooked once, as views rebuild
+        if (!railHooked) {
+            railHooked = true
+            root.viewTreeObserver.addOnPreDrawListener {
+                letterRail?.let { r -> if (r.alpha != appsScroll.alpha) r.alpha = appsScroll.alpha }
+                true
+            }
+        }
         searchPill = SearchPill(activity, dp, activity.getString(R.string.search_hint))
         searchPill.setOnClickListener { openSearch() }
         val gap = dp.dpi(8f)
@@ -584,6 +746,8 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         val dark = colors != null && (colors.colorHints and android.app.WallpaperColors.HINT_SUPPORTS_DARK_THEME) != 0
         applyTextMode()
         indicator.darkWallpaper = dark
+        val sysAccent = try { activity.getColor(android.R.color.system_accent1_400) } catch (_: Exception) { 0 }
+        if (sysAccent != 0) com.oneuiclone.home.ui.WallpaperHistory.recordCurrentAccent(activity, sysAccent)
     }
 
     private fun applyTextMode() {
@@ -606,6 +770,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
 
     private fun applyBadge(v: IconView, pkgs: List<Pair<String, android.os.UserHandle>>) {
         v.badgeNumber = prefs.badgeNumbers
+        v.badgeStyle = prefs.badgeStyle
         v.badgeCount = if (!prefs.badges) 0 else pkgs.sumOf { BadgeService.count(it.first, it.second) }
     }
 
@@ -839,10 +1004,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             isLongClickable = false                       // the widget container owns the long-press
             setOnClickListener { openBubbles(item.appWidgetId, this) }
             setOnTouchListener { _, ev ->
-                when (ev.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> ripple.start(homeSiblings(), ev.rawX, ev.rawY)
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> ripple.reverse()
-                }
+                if (ev.actionMasked == MotionEvent.ACTION_DOWN) ripple.bounce(homeSiblings(), ev.rawX, ev.rawY)
                 false
             }
         }
@@ -894,10 +1056,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
                 hole = { Rect().also { icon.iconBoundsOnScreen(it) }.apply { inset(-width() / 8, -height() / 8) } },
                 hide = { icon.iconVisible = !it })) }
             setOnTouchListener { _, ev ->
-                when (ev.actionMasked) {
-                    MotionEvent.ACTION_DOWN -> ripple.start(homeSiblings(), ev.rawX, ev.rawY)
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> ripple.reverse()
-                }
+                if (ev.actionMasked == MotionEvent.ACTION_DOWN) ripple.bounce(homeSiblings(), ev.rawX, ev.rawY)
                 false
             }
         }
@@ -911,7 +1070,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             centred = com.oneuiclone.home.widgets.QuickOpenWidget.pairCentred(activity, appWidgetId)
             label = ""
             contentDescription = activity.getString(R.string.quick_pair_widget)
-            onPress = { ev, down -> if (down) ripple.start(homeSiblings(), ev.rawX, ev.rawY) else ripple.reverse() }
+            onPress = { ev, down -> if (down) ripple.bounce(homeSiblings(), ev.rawX, ev.rawY) }
             onTap = { kind -> openQuickOpen(kind, null) }
         }
 
@@ -1063,6 +1222,13 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
 
     /** A folder's saved style on its closed icon: Blur shows the blurred wallpaper under its colour, faded by the transparency. */
     private fun applyFolderStyle(icon: FolderIconView, folder: HomeItem.Folder) {
+        if (icon is LargeFolderIconView) {
+            icon.hasCustomTint = folder.color != 0
+            icon.glass = widgetGlass
+            val t = com.oneuiclone.home.widgets.WidgetStyles.folderTransparency(activity, folder.id)
+            icon.fillOpacity = if (t == null) 1f else 1f - t / 100f
+            return
+        }
         // the see-through themes (Frosted, Clear Colour): a folder with no colour of its own is frosted as the icons
         // are: the Icon colour exactly as see-through as their plates (Clear Colour's veil on average, as it lightens
         // toward the foot), over the glass, so it matches the icons round it (user, 0.245; 0.246: 0.245 used the
@@ -1183,13 +1349,17 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             val content = model!!.appsInFolder(item.id).mapNotNull { r.get(it.key) }
             com.oneuiclone.home.ui.LargeFolderIconView(activity, dp).apply {
                 this.item = item
+                folderId = item.id
                 label = item.title
-                apps = content.map { it.previewIcon to it }
+                // Full-size regular Home icons inside the Liquid Crystal Pane (with their own glass plates)
+                apps = content.map { it.icon to it }
+                if (prefs.iconGlass) plateGlass = widgetGlass
                 if (item.color != 0) bgColor = item.color
                 applyFolderStyle(this, item)
                 setOnClickListener {
                     val i = hitApp(lastTouchX, lastTouchY)
-                    if (i >= 0) launch(this, content[i]) else folders.open(this, item, content, model!!.appsInFolder(item.id).filter { r.get(it.key) != null })
+                    if (i >= 0) launch(this, content[i], slotFor(i))
+                    else folders.open(this, item, content, model!!.appsInFolder(item.id).filter { r.get(it.key) != null })
                 }
                 attachItem(this, item, null, false) { homeSiblings() }
             }
@@ -1199,6 +1369,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
                 this.item = item
                 label = item.title
                 previews = content.map { it.previewIcon }
+                previewKeys = content.map { it.key }
                 if (item.color != 0) bgColor = item.color
                 applyFolderStyle(this, item)
                 setOnClickListener {
@@ -1228,39 +1399,76 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
     private fun attachRipple(v: View, siblings: () -> List<View>) = attachItem(v as IconView, null, null, false, siblings)
 
     /**
-     * Touch handling shared by every icon: 8.5 ripple on press, long-press → quick options, then drag once
+     * Touch handling shared by every icon: press bounce, long-press → quick options, then drag once
      * the finger moves past the touch slop (popup dismisses, One UI behaviour).
      */
     @android.annotation.SuppressLint("ClickableViewAccessibility")
     private fun attachItem(v: IconView, item: HomeItem?, app: AppInfo?, fromApps: Boolean, siblings: () -> List<View>) {
         v.setOnLongClickListener {
-            ripple.reverse()
             v.parent?.requestDisallowInterceptTouchEvent(true)
             showQuickOptions(v, item, app, fromApps)
             dragArmed = v
+            longPressAt = android.os.SystemClock.uptimeMillis()
             true
         }
         v.setOnTouchListener { _, ev ->
             when (ev.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     armX = ev.rawX; armY = ev.rawY
+                    gliding = false
+                    glideOk = null
                     app?.let { shortcutLoader.prefetch(it) }      // ready by the time a long-press fires
-                    ripple.start(siblings(), ev.rawX, ev.rawY)
+                    ripple.bounce(siblings(), ev.rawX, ev.rawY)   // one bounce in and back; hold and lift don't touch it
                 }
                 MotionEvent.ACTION_MOVE -> {
                     if (drag.isDragging) { drag.move(ev.rawX, ev.rawY); return@setOnTouchListener true }
-                    if (dragArmed === v && !(prefs.lockLayout && !fromApps) && kotlin.math.hypot(ev.rawX - armX, ev.rawY - armY) > slop) {
+                    val moved = dragArmed === v && kotlin.math.hypot(ev.rawX - armX, ev.rawY - armY) > slop
+                    // Glide: sliding onto the card picks a row; anywhere else drags the icon as before. Only when
+                    // the finger rested a moment after the buzz (it read the menu): moving straight off on the
+                    // buzz is always a drag, so moving an icon a row up (under the card) still works. On the
+                    // icon or the gap up to the card it waits, but only if the finger set off towards the card
+                    // (sideways and away-from-card moves drag at once). Leaving the card off its far sides
+                    // picks the icon up from there.
+                    if (moved && glideOk == null) glideOk = popup != null && android.os.SystemClock.uptimeMillis() - longPressAt >= GLIDE_SETTLE_MS
+                    val p = popup
+                    if (moved && p != null && glideOk == true) {
+                        when (p.glideZone(ev.rawX, ev.rawY, slop.toFloat())) {
+                            com.oneuiclone.home.ui.QuickOptionPopup.ZONE_CARD -> {
+                                gliding = true
+                                p.glideAt(ev.rawX, ev.rawY)
+                                return@setOnTouchListener true
+                            }
+                            com.oneuiclone.home.ui.QuickOptionPopup.ZONE_PATH -> {
+                                val towards = if (p.cardAbove()) armY - ev.rawY else ev.rawY - armY
+                                if (gliding || towards > kotlin.math.abs(ev.rawX - armX)) {
+                                    p.glideCancel()
+                                    return@setOnTouchListener true
+                                }
+                            }
+                        }
+                        p.glideCancel()
+                    }
+                    if (moved && !(prefs.lockLayout && !fromApps)) {
+                        gliding = false
                         popup?.dismiss()
                         ripple.reset()                           // neighbours may slide aside to make room
                         if (fromApps) state.setImmediate(StateController.State.HOME)
                         // from an open folder: it stays up while the drag is on it, to rearrange its apps
+                        dragFolderApps = (item as? HomeItem.Folder)?.let { f -> model?.appsInFolder(f.id) } ?: emptyList()
                         drag.start(v, item, app, fromApps, ev.rawX, ev.rawY,
                             if (item?.container == Container.FOLDER) folders.beginDrag(v) else null)
                         return@setOnTouchListener true
                     }
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    ripple.reverse()
+                    if (gliding) {
+                        gliding = false
+                        dragArmed = null
+                        v.isPressed = false
+                        val picked = ev.actionMasked == MotionEvent.ACTION_UP && popup?.glideRelease() == true
+                        if (!picked) popup?.glideCancel()
+                        return@setOnTouchListener true
+                    }
                     val wasDragging = drag.isDragging
                     if (wasDragging) { drag.drop(); folders.finishDetached() }
                     dragArmed = null
@@ -1281,9 +1489,12 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             opts += com.oneuiclone.home.ui.QuickOption("Add to Home", com.oneuiclone.home.ui.QuickOption.ADD) { addToHome(app) }
         } else if (item != null && !prefs.lockLayout) {
             opts += com.oneuiclone.home.ui.QuickOption("Remove", com.oneuiclone.home.ui.QuickOption.REMOVE) {
+                val inside = if (item is HomeItem.Folder) m.appsInFolder(item.id) else emptyList()
                 m.items.remove(item)
                 if (item is HomeItem.Folder) m.items.removeAll { it is HomeItem.App && it.folderId == item.id }
                 m.save(); bindWorkspace()
+                // from inside an open folder it may dissolve the folder: no undo for that one
+                if (item.container != Container.FOLDER) offerUndo(item, inside)
             }
         }
         if (item is HomeItem.Folder && !fromApps) {
@@ -1456,7 +1667,16 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
                 attachItem(this, null, app, true) { appsSiblings() }
             }, i % dp.appsCols, i / dp.appsCols)
         }
+        letterRail?.letters = com.oneuiclone.home.ui.LetterRail.sections(apps.map { it.label })
         updateBadges()
+    }
+
+    /** Letter rail: scrolls the Apps list so the row with app [index] sits where the first row does at the top. */
+    private fun scrollAppsTo(index: Int) {
+        val row = appsGrid.getChildAt(index) ?: return
+        val first = appsGrid.getChildAt(0) ?: return
+        val max = (appsGrid.height - appsScroll.height).coerceAtLeast(0)
+        appsScroll.smoothScrollTo(0, (row.top - first.top).coerceIn(0, max))
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -1464,19 +1684,20 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
     // ---------------------------------------------------------------------------------------------
 
     /** An open folder stays up and zooms with the open ([openContent]); onStop closes it once Home is off screen. */
-    fun launch(v: IconView, app: AppInfo) {
+    fun launch(v: IconView, app: AppInfo, largeSlot: Int = -1) {
         if (AppBubbles.inSingleTaskBubble(activity, app)) {
             AnimLog.log("tap ${app.label}: single-task app in a bubble, opening the bubble")
             usage.launched(app.key)
-            AppBubbles.show(activity, app) { start(v, app) }
+            AppBubbles.show(activity, app) { start(v, app, largeSlot) }
             return
         }
-        start(v, app)
+        start(v, app, largeSlot)
     }
 
-    private fun start(v: IconView, app: AppInfo) {
+    private fun start(v: IconView, app: AppInfo, largeSlot: Int = -1) {
         val bounds = Rect()
-        v.iconBoundsOnScreen(bounds)
+        val part = if (largeSlot >= 0 && v is LargeFolderIconView) Rect().also { v.slotRect(largeSlot, it) } else null
+        v.iconBoundsOnScreen(bounds, part)
         usage.launched(app.key)
         open(app.label.toString(), app, "Can't open ${app.label}", v) { launcherApps.startMainActivity(app.key.component, app.user, bounds, null) }
     }
@@ -2412,6 +2633,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
 
     fun onTopResumedChanged(top: Boolean) {
         homeTopResumed = top
+        if (top) settleOnUnlock("top")
         root.removeCallbacks(navSwipeOverSearch)
         if (!top && homeResumed && search?.isOpen == true) root.postDelayed(navSwipeOverSearch, NAV_SWIPE_CHECK_MS)
     }
@@ -2429,6 +2651,8 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
     }
 
     fun onStop() {
+        homeMenu?.let { (it.parent as? ViewGroup)?.removeView(it); homeMenu = null }
+        undoPill?.hide(now = true)
         endLightFrame("stopped")
         returnFrameAt = 0L
         drawnOnce = true
@@ -2443,8 +2667,8 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         root.removeCallbacks(launchFallback)
         homeHidden()
         // Left for an app Home didn't open (Recents, a quick switch, a notification): the way back zooms in all the same.
-        // Not for the screen going off, so unlocking doesn't play a close.
-        if (RECENTS_CLOSE_ZOOM && !pendingReturnAnim && !edit.isActive && search?.isOpen != true && awake() &&
+        // Not for the screen going off or a screen saver, so unlocking doesn't play a close.
+        if (RECENTS_CLOSE_ZOOM && !pendingReturnAnim && !edit.isActive && search?.isOpen != true && awake() && !dreaming &&
             !activity.isChangingConfigurations) {   // recreated (new wallpaper colours): Home stays on screen
             pendingReturnAnim = true
             lastLaunchedApp = null
@@ -2545,6 +2769,54 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         // Launchii's live wallpaper follows Home's zoom rather than a parked one.
         if (!pendingReturnAnim && com.oneuiclone.home.ui.LiveWallpaper.drives) com.oneuiclone.home.ui.LiveWallpaper.setZoom(wallpaperZoom)
         playReturnAnimation()
+        settleOnUnlock("resume")
+    }
+
+    // ---- unlock settle (0.262, design opinion 10) ----
+
+
+    /**
+     * Unlocked straight to Home: the wallpaper eases out from [UNLOCK_ZOOM] and Home's icons, widgets and search row
+     * ripple in from the fingerprint sensor (nearest first), instead of Home just being there. Called on resume, on
+     * becoming the top activity and when the keyguard goes, whichever finds Home in front first; not over a return,
+     * edit mode, search or a folder, nor when unlocking into an app.
+     *
+     * Behind a PIN, Home resumes and becomes top as the keyguard starts going away, while it still reports locked, and
+     * plays then, with the keyguard's exit. A screen saver ending resumes Home under the still-showing keyguard
+     * without making it top, so locked + not top waits. (0.262 waited for "unlocked" and a 4 s window from the
+     * wake, so it skipped whenever the lock screen was up a while; 0.274 missed screen savers, fixed in 0.276.)
+     */
+    private fun settleOnUnlock(why: String) {
+        // (a resume while [dreaming] is the screen saver ending: DREAMING_STOPPED comes ~0.7 s later)
+        if (!unlockArmed || !activity.getSystemService(android.os.PowerManager::class.java).isInteractive) return
+        val locked = activity.getSystemService(android.app.KeyguardManager::class.java).isKeyguardLocked
+        if (locked && !homeTopResumed) return   // under the keyguard, not yet in front: the unlock will come
+        unlockArmed = false
+        // the keyguard went a while before Home showed: unlocked into an app (or a notification) and came back later
+        if (!locked && presentAt != 0L && android.os.SystemClock.uptimeMillis() - presentAt > UNLOCK_PRESENT_GRACE_MS) return
+        if (!prefs.unlockSettle) return
+        if (!::dp.isInitialized || pendingReturnAnim || edit.isActive || search != null || folders.isOpen || drag.isDragging ||
+            state.state != StateController.State.HOME || state.isTransitioning) return
+        AnimLog.log("unlock settle ($why)")
+        zoomAnim?.cancel()
+        wallpaperZoom = UNLOCK_ZOOM
+        wallpaper.setZoom(wallpaperZoom)
+        animateWallpaperZoom(1f, UNLOCK_WALLPAPER_MS, Easing.CUBIC_OUT)
+        val ox = dp.widthPx / 2f
+        val oy = dp.heightPx * UNLOCK_SENSOR_Y
+        val far = kotlin.math.hypot(ox, oy)
+        val loc = IntArray(2)
+        val views = homeSiblings() + listOfNotNull(indicator, homeSearch, if (::updatePill.isInitialized) updatePill else null)
+        for (v in views) {
+            if (v.visibility != View.VISIBLE || v.alpha < 0.99f || !v.isAttachedToWindow) continue
+            v.getLocationOnScreen(loc)
+            val d = kotlin.math.hypot(loc[0] + v.width / 2f - ox, loc[1] + v.height / 2f - oy)
+            v.animate().cancel()
+            v.alpha = 0f; v.scaleX = 0.86f; v.scaleY = 0.86f
+            v.animate().alpha(1f).scaleX(1f).scaleY(1f)
+                .setStartDelay((d / far * UNLOCK_RIPPLE_MS).toLong()).setDuration(UNLOCK_ICON_MS)
+                .setInterpolator(Easing.STANDARD).start()
+        }
     }
 
     /**
@@ -2657,6 +2929,11 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
     // ---------------------------------------------------------------------------------------------
 
     fun onNewIntent(intent: Intent, alreadyOnHome: Boolean) {
+        if (intent.getBooleanExtra(EXTRA_OPEN_WIDGETS, false)) {
+            intent.removeExtra(EXTRA_OPEN_WIDGETS)
+            // once Home is back in front (and anything the home intent closes has closed)
+            root.postDelayed({ if (state.state == StateController.State.HOME && picker == null) onWidgetsButton() }, 450)
+        }
         android.util.Log.i("OneUiHome", "onNewIntent extras=" + intent.extras?.keySet() + " onHome=" + alreadyOnHome)
         // a new Home (its process was killed behind the app) starts drawing from nothing: same empty first frame
         if (!alreadyOnHome && !drawnOnce) returningToHome("new instance")
@@ -2696,6 +2973,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             playReturnAnimation()
         }
         popup?.dismiss()
+        homeMenu?.dismiss()
         resizeFrame?.dismiss()
         drag.cancel()
         quickOpen?.close(animate = alreadyOnHome)
@@ -2731,7 +3009,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         fun rect(): Rect {
             widget?.let { w -> return Rect(0, 0, w.width, w.height).also { homeLayer.offsetDescendantRectToMyCoords(w, it) } }
             val icon = view as IconView
-            val r = part() ?: Rect(0, 0, icon.iconSizePx(), icon.iconSizePx())
+            val r = part() ?: Rect(0, 0, icon.iconSizePx(), icon.iconHeightPx())
             r.offset(icon.iconLeft(), icon.iconTop())
             homeLayer.offsetDescendantRectToMyCoords(icon, r)
             return r
@@ -2936,6 +3214,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         quickOpen?.takeIf { it.isOpen }?.let { it.close(); return true }
         if (search?.isOpen == true) { closeSearch(); return true }
         popup?.let { it.dismiss(); return true }
+        homeMenu?.let { it.dismiss(); return true }
         resizeFrame?.let { it.dismiss(); return true }
         picker?.let { it.dismiss(); return true }
         if (edit.isActive) { edit.exit(); return true }
@@ -2990,7 +3269,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
                     return false
                 }
                 // sheets/popups own their vertical gestures (the widget list scrolls, resize handles drag)
-                if (folders.isOpen || edit.isActive || search != null || picker != null || popup != null || quickOpen != null ||
+                if (folders.isOpen || edit.isActive || search != null || picker != null || popup != null || homeMenu != null || quickOpen != null ||
                     resizeFrame != null || drag.isDragging) return false
                 if (ev.pointerCount >= 2) return checkPinch(ev)
                 val dx = ev.x - downX
@@ -3001,11 +3280,11 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
                     // Just below the dock icons and down, swiping up belongs to the system's home / recents gesture
                     if (state.state == StateController.State.HOME && dy < 0 && downY >= swipeUpDeadLine()) return false
                     if (state.state == StateController.State.HOME && dy < 0) {
-                        if (prefs.swipeUpSearch && !prefs.swipeDownSearch) { startSearchLift(fromAbove = false); consumed = true } else startTracking(true)
+                        if (prefs.swipeUpSearch && !prefs.swipeDownSearch) { startSearchLift(fromAbove = false, startY = ev.y); consumed = true } else startTracking(true)
                         return true
                     }
                     if (state.state == StateController.State.HOME && dy > 0 && prefs.swipeDownSearch) {
-                        startSearchLift(fromAbove = true); consumed = true; return true
+                        startSearchLift(fromAbove = true, startY = ev.y); consumed = true; return true
                     }
                     if (state.state == StateController.State.HOME && dy > 0 && prefs.swipeDownNotifications) {
                         expandNotifications(); consumed = true; return true
@@ -3059,6 +3338,197 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             return true
         }
         return false
+    }
+
+    /** Cached miniature re-tinted icons for Recent wallpapers previews, keyed by (accent + icon settings + visible keys). */
+    private val tileIconCache = android.util.LruCache<String, Map<AppKey, android.graphics.Bitmap>>(6)
+
+    /**
+     * Hold an empty spot on Home (0.263, design opinion 4 C): the card with the last few wallpapers set through
+     * Launchii, each shown with Home on it, and the shortcuts that edit mode's buttons have. Pinch opens edit mode.
+     */
+    private fun showHomeMenu(x: Float, y: Float) {
+        snapshotHome { shot ->
+            if (homeMenu != null || edit.isActive || state.state != StateController.State.HOME || !homeResumed) return@snapshotHome
+            val m = com.oneuiclone.home.ui.HomeMenu(activity, dp, iconFactory.isNight(), shot,
+                onStyle = { onStyleButton() },
+                onWidgets = { onWidgetsButton() },
+                onIcons = { onIconsButton() },
+                onEdit = { edit.enter() },
+                onSettings = { onSettingsButton() },
+                onPick = { e ->
+                    // icons' and widgets' frosted glass fades with the wallpaper instead of switching first
+                    widgetGlass.armFade()
+                    com.oneuiclone.home.ui.WallpaperHistory.pick(activity, e, prefs.homeBlurLevel) { ok ->
+                        if (!ok) Toast.makeText(activity, "Couldn't set that wallpaper", Toast.LENGTH_SHORT).show()
+                    }
+                },
+                onDismissed = { homeMenu = null },
+                backdrop = { rect, done -> snapshotBehind(rect, done) })
+            overlay.addView(m, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+            m.showAt(x, y)
+            homeMenu = m
+            val hasOwn = com.oneuiclone.home.ui.WallpaperLayer.hasOwnCopy(activity)
+            val wantPalette = prefs.themeColor == 0 && com.oneuiclone.home.icons.IconFactory.usesPalette(
+                prefs.themedIcons, prefs.darkIcons, prefs.minimalIcons, prefs.iconLook)
+            val visibleKeys = if (wantPalette) visibleHomeAppKeys() else emptyList()
+            val night = iconFactory.isNight()
+            val themed = prefs.themedIcons; val themeAll = prefs.themeAllApps; val plateAlpha = prefs.iconPlateAlpha
+            val dark = prefs.darkIcons; val minimal = prefs.minimalIcons; val look = prefs.iconLook; val mode = prefs.iconMode
+            val shape = prefs.iconShape; val shine = prefs.iconShine; val comic = prefs.comicBorder
+            val thumbIconSize = maxOf(48, dp.iconSizePx / 2)
+            val perTileIcons = HashMap<String, Map<AppKey, android.graphics.Bitmap>>()
+            com.oneuiclone.home.ui.WallpaperHistory.loadForMenu(
+                activity, root.width, root.height, skipFirstGlass = hasOwn,
+                extraWork = { loaded ->
+                    if (!wantPalette || visibleKeys.isEmpty()) return@loadForMenu
+                    var factory: com.oneuiclone.home.icons.IconFactory? = null
+                    var rawDrawables: Map<AppKey, android.graphics.drawable.Drawable>? = null
+                    loaded.forEachIndexed { i, lt ->
+                        if (hasOwn && i == 0) return@forEachIndexed
+                        val acc = lt.accent
+                        if (acc == 0) return@forEachIndexed
+                        val ck = "$acc|$thumbIconSize|$look|$mode|$plateAlpha|$shape|$shine|$comic|$night|${visibleKeys.hashCode()}"
+                        val cached = tileIconCache.get(ck)
+                        if (cached != null) { perTileIcons[lt.entry.hash] = cached; return@forEachIndexed }
+                        val f = factory ?: com.oneuiclone.home.icons.IconFactory(activity).also { factory = it }
+                        val drawables = rawDrawables ?: resolveDrawables(visibleKeys).also { rawDrawables = it }
+                        f.ownColour = acc
+                        val built = HashMap<AppKey, android.graphics.Bitmap>(drawables.size)
+                        for ((k, d) in drawables) {
+                            try {
+                                built[k] = f.homeIcon(d, thumbIconSize, night, themed, themeAll, plateAlpha, dark,
+                                    k.component.packageName, minimal, look, mode).first
+                            } catch (_: Exception) {}
+                        }
+                        tileIconCache.put(ck, built)
+                        perTileIcons[lt.entry.hash] = built
+                    }
+                },
+            ) { list ->
+                if (homeMenu !== m || m.isDismissing) return@loadForMenu
+                val keyedMap = captureCurrentPageKeyedWidgets()
+                fun tileOverlay(lt: com.oneuiclone.home.ui.WallpaperHistory.LoadedTile): android.graphics.Bitmap? {
+                    val g = lt.glass ?: return null
+                    val fTint = if (wantPalette && prefs.seeThroughPlates && lt.accent != 0) {
+                        (lt.accent and 0x00FFFFFF) or ((prefs.iconTintAlpha.coerceIn(0f, 1f) * 255).toInt() shl 24)
+                    } else 0
+                    return renderTileOverlay(g, lt.crystal, perTileIcons[lt.entry.hash], fTint, lt.bright, keyedMap)
+                }
+                // the current wallpaper is the newest entry while Launchii's copy is what's showing; one set elsewhere
+                // comes first as its colours (Launchii can't read it), and the history follows
+                val tiles = ArrayList<com.oneuiclone.home.ui.HomeMenu.Tile>()
+                if (hasOwn && list.isNotEmpty()) {
+                    list.forEachIndexed { i, lt ->
+                        val ov = if (i == 0) null else tileOverlay(lt)
+                        tiles += com.oneuiclone.home.ui.HomeMenu.Tile(lt.entry, lt.thumb, current = i == 0, overlay = ov)
+                    }
+                } else {
+                    val c = try { android.app.WallpaperManager.getInstance(activity).getWallpaperColors(android.app.WallpaperManager.FLAG_SYSTEM) } catch (_: Exception) { null }
+                    val cols = listOfNotNull(c?.primaryColor, c?.secondaryColor, c?.tertiaryColor).map { it.toArgb() }.toIntArray()
+                    tiles += com.oneuiclone.home.ui.HomeMenu.Tile(null, null, current = true, colours = cols)
+                    list.take(com.oneuiclone.home.ui.WallpaperHistory.MAX - 1).forEach { lt ->
+                        tiles += com.oneuiclone.home.ui.HomeMenu.Tile(lt.entry, lt.thumb, current = false, overlay = tileOverlay(lt))
+                    }
+                }
+                if (tiles.size < com.oneuiclone.home.ui.WallpaperHistory.MAX) tiles += com.oneuiclone.home.ui.HomeMenu.Tile(null, null, current = false, add = true)
+                m.setTiles(tiles)
+            }
+        }
+    }
+
+    /** App keys currently visible on Home's active page and dock (including inside folders), for per-tile icon tinting. */
+    private fun visibleHomeAppKeys(): List<AppKey> {
+        val m = model ?: return emptyList()
+        val page = if (::workspace.isInitialized) workspace.currentPage else 0
+        val out = LinkedHashSet<AppKey>()
+        for (it in m.items) {
+            val onScreen = it.container == Container.HOTSEAT || (it.container == Container.WORKSPACE && it.screen == page)
+            if (!onScreen) continue
+            when (it) {
+                is HomeItem.App -> out += it.key
+                is HomeItem.Folder -> m.appsInFolder(it.id).forEach { a -> out += a.key }
+                else -> {}
+            }
+        }
+        return out.toList()
+    }
+
+    /** Resolves raw launcher icon drawables for [keys] off the main thread. */
+    private fun resolveDrawables(keys: List<AppKey>): Map<AppKey, android.graphics.drawable.Drawable> {
+        val la = activity.getSystemService(android.content.pm.LauncherApps::class.java)
+        val um = activity.getSystemService(android.os.UserManager::class.java)
+        val dpi = activity.resources.displayMetrics.densityDpi
+        val out = HashMap<AppKey, android.graphics.drawable.Drawable>(keys.size)
+        for (k in keys) {
+            val user = um.getUserForSerialNumber(k.userSerial) ?: continue
+            val info = try { la.resolveActivity(Intent(Intent.ACTION_MAIN).setComponent(k.component), user) } catch (_: Exception) { null } ?: continue
+            val raw = info.getIcon(dpi)
+            out[k] = if (user == Process.myUserHandle()) raw else activity.packageManager.getUserBadgedIcon(raw, user)
+        }
+        return out
+    }
+
+    /** Pre-captures any colour-key widgets on the active Home page once so all non-current tile overlays share them. */
+    private fun captureCurrentPageKeyedWidgets(): Map<Int, com.oneuiclone.home.widgets.WidgetManager.WidgetCapture> {
+        if (!::workspace.isInitialized) return emptyMap()
+        val page = workspace.pageAt(workspace.currentPage) as? ViewGroup ?: return emptyMap()
+        val out = HashMap<Int, com.oneuiclone.home.widgets.WidgetManager.WidgetCapture>()
+        for (i in 0 until page.childCount) {
+            val wc = page.getChildAt(i) as? com.oneuiclone.home.ui.WidgetContainer ?: continue
+            val rv = wc.getChildAt(0) as? com.oneuiclone.home.widgets.WidgetManager.RoundedWidgetView ?: continue
+            if (rv.isKeyed) rv.capture(0.35f)?.let { out[wc.item.appWidgetId] = it }
+        }
+        return out
+    }
+
+    /** Renders [homeLayer] at 1/3 screen size frosted against a tile's own blurred wallpaper, without touching live views. */
+    private fun renderTileOverlay(
+        glassBmp: android.graphics.Bitmap,
+        crystalBmp: android.graphics.Bitmap?,
+        icons: Map<AppKey, android.graphics.Bitmap>?,
+        folderTint: Int,
+        bright: Boolean,
+        keyedMap: Map<Int, com.oneuiclone.home.widgets.WidgetManager.WidgetCapture>,
+    ): android.graphics.Bitmap? {
+        if (root.width == 0 || root.height == 0) return null
+        val w = maxOf(1, root.width / 3); val h = maxOf(1, root.height / 3)
+        return try {
+            val pic = android.graphics.Picture()
+            val c = pic.beginRecording(w, h)
+            c.scale(w / root.width.toFloat(), h / root.height.toFloat())
+            com.oneuiclone.home.ui.GlassPaint.withOverride(
+                bitmap = glassBmp,
+                scale = root.width / glassBmp.width.toFloat(),
+                crystalBitmap = crystalBmp,
+                crystalScale = if (crystalBmp != null) root.width / crystalBmp.width.toFloat() else 1f,
+                icons = icons,
+                folderTint = folderTint,
+                darkText = bright,
+                keyedWidgets = keyedMap,
+            ) {
+                homeLayer.draw(c)
+            }
+            pic.endRecording()
+            val hw = android.graphics.Bitmap.createBitmap(pic, w, h, android.graphics.Bitmap.Config.HARDWARE)
+            val sw = hw.copy(android.graphics.Bitmap.Config.ARGB_8888, false)
+            hw.recycle()
+            sw
+        } catch (e: Exception) {
+            android.util.Log.w("OneUiHome", "home menu tile overlay failed", e)
+            null
+        }
+    }
+
+    /** Home as drawn now, without the wallpaper (the window is see-through there), at a third of its size. */
+    private fun snapshotHome(done: (android.graphics.Bitmap?) -> Unit) {
+        val w = maxOf(1, root.width / 3); val h = maxOf(1, root.height / 3)
+        val shot = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+        try {
+            android.view.PixelCopy.request(activity.window, Rect(0, 0, root.width, root.height), shot, { result ->
+                root.post { done(if (result == android.view.PixelCopy.SUCCESS) shot else null) }
+            }, backdropHandler)
+        } catch (_: Exception) { done(null) }
     }
 
     private fun showAppsMenu(anchor: View) {
@@ -3115,7 +3585,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             onRequestContacts = {
                 activity.requestPermissions(arrayOf(android.Manifest.permission.READ_CONTACTS), LauncherActivity.REQUEST_CONTACTS)
             },
-            canSwipeHome = { !drag.isDragging && popup == null && dragArmed == null },
+            canSwipeHome = { !drag.isDragging && popup == null && homeMenu == null && dragArmed == null },
             onSwipeHome = { closeSearch(toHome = true) },
             // with Swipe down for search a swipe up undoes it (the Apps screen is a swipe up from Home)
             onSwipeUp = { if (prefs.swipeDownSearch) closeSearch(lift = true) else searchToApps() },
@@ -3180,6 +3650,9 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
     private var liftTracking = false
     private var liftDownY = 0f
     private var liftFromAbove = false
+    /** Unsmoothed finger progress during a drag (used for [LIFT_COMMIT] even when a fast flick is rate-limited). */
+    private var liftRaw = 0f
+    private var liftDragAt = 0L
     /** The open search came in by Lift-Off, so it goes back to Home the same way; [liftClosing] while it does. */
     private var searchLift = false
     private var liftClosing = false
@@ -3193,12 +3666,14 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         search?.setLift(p)
     }
 
-    private fun startSearchLift(fromAbove: Boolean) {
+    private fun startSearchLift(fromAbove: Boolean, startY: Float) {
         openSearch(fromHome = true, fromAbove = fromAbove, follow = true)
         if (search?.isLifting != true) return
         liftTracking = true
-        liftDownY = downY
+        liftDownY = startY
         liftFromAbove = fromAbove
+        liftRaw = 0f
+        liftDragAt = SystemClock.uptimeMillis()
     }
 
     /** A finger caught the lift mid-spring at [y]: it carries on from where it is. */
@@ -3206,21 +3681,29 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         liftSpring?.cancel(); liftSpring = null
         search?.bounceBar(0f)
         liftTracking = true
+        liftRaw = lift
+        liftDragAt = SystemClock.uptimeMillis()
         val d = lift * liftDistance()
         liftDownY = if (liftFromAbove) y - d else y + d
     }
 
-    /** Follows the finger 1:1 (a soft stop past the end). */
+    /** Follows the finger 1:1 up to [LIFT_MAX_DRAG_RATE] (a soft stop past the end); fast flicks advance smoothly instead of jumping past the animation. */
     private fun dragLift(y: Float) {
         val r = (if (liftFromAbove) y - liftDownY else liftDownY - y) / liftDistance()
-        applyLift(if (r > 1f) 1f + 0.16f * (1f - exp(-(r - 1f) * 2.4f)) else r.coerceAtLeast(0f))
+        val target = if (r > 1f) 1f + 0.16f * (1f - exp(-(r - 1f) * 2.4f)) else r.coerceAtLeast(0f)
+        liftRaw = target
+        val now = SystemClock.uptimeMillis()
+        val dt = ((now - liftDragAt) / 1000f).coerceIn(0f, 0.02f)
+        liftDragAt = now
+        val maxStep = LIFT_MAX_DRAG_RATE * dt
+        applyLift(lift + (target - lift).coerceIn(-maxStep, maxStep))
     }
 
     /** [velocity]: px/ms toward search. */
     private fun releaseLift(velocity: Float) {
         liftTracking = false
         val pv = velocity / liftDistance()
-        val open = pv > LIFT_FLICK || (pv > -LIFT_BACK_FLICK && lift > LIFT_COMMIT)
+        val open = pv > LIFT_FLICK || (pv > -LIFT_BACK_FLICK && liftRaw > LIFT_COMMIT)
         // the harder the swipe, the more the bar overshoots when it lands (none for a slow let-go)
         val bounce = if (open) ((pv - LIFT_BOUNCE_FROM) / LIFT_BOUNCE_RANGE).coerceIn(0f, 1f) else 0f
         springLift(if (open) 1f else 0f, pv * 1000f, bounce)
@@ -3235,10 +3718,18 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         liftSpring?.cancel()
         liftTarget = target
         search?.bounceBar(if (target >= 1f) dp.dp(LIFT_BOUNCE_DP) * bounce else 0f)
+        // Cap flick speed and keep it within the critically damped no-overshoot bound ω·|target − lift| so a hard
+        // flick never slams through 1.0 (or 0.0) into the visual clamp and skips the animation.
+        val w = sqrt(LIFT_STIFFNESS)
+        val startVelocity = if (target >= 1f) {
+            velocity.coerceIn(-LIFT_MAX_SPRING_VELOCITY, minOf(LIFT_MAX_SPRING_VELOCITY, w * maxOf(0f, target - lift)))
+        } else {
+            velocity.coerceIn(-minOf(LIFT_MAX_SPRING_VELOCITY, w * maxOf(0f, lift - target)), LIFT_MAX_SPRING_VELOCITY)
+        }
         lateinit var a: SpringAnimation
         a = SpringAnimation(FloatValueHolder(lift)).apply {
             spring = SpringForce(target).setStiffness(LIFT_STIFFNESS).setDampingRatio(SpringForce.DAMPING_RATIO_NO_BOUNCY)
-            setStartVelocity(velocity)
+            setStartVelocity(startVelocity)
             setMinimumVisibleChange(0.002f)
             addUpdateListener { _, value, _ ->
                 if (liftSpring !== a) return@addUpdateListener
@@ -3433,6 +3924,14 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             drawPictureFrame(canvas, pic) { drawChild(canvas, it, t) }
         }
 
+        override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> peekLabels(true)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> peekLabels(false)
+            }
+            return super.dispatchTouchEvent(ev)
+        }
+
         override fun onInterceptTouchEvent(ev: MotionEvent): Boolean =
             interceptVertical(ev) || super.onInterceptTouchEvent(ev)
 
@@ -3444,6 +3943,53 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
             }
             return touchVertical(ev)
         }
+    }
+
+    /**
+     * Hardware-safe, glass-aware capture of widget [appWidgetId] on Home so Set wallpaper and Wallpaper & style
+     * previews can re-frost it live against any wallpaper.
+     */
+    fun widgetCapture(appWidgetId: Int): com.oneuiclone.home.widgets.WidgetManager.WidgetCapture? {
+        if (!::workspace.isInitialized) return null
+        for (p in 0 until workspace.childCount) {
+            val page = workspace.getChildAt(p) as? ViewGroup ?: continue
+            for (i in 0 until page.childCount) {
+                val wc = page.getChildAt(i) as? com.oneuiclone.home.ui.WidgetContainer ?: continue
+                if (wc.item.appWidgetId != appWidgetId || wc.width == 0 || wc.height == 0) continue
+                val child = wc.getChildAt(0) ?: return null
+                if (child is com.oneuiclone.home.widgets.WidgetManager.RoundedWidgetView) {
+                    return child.capture(scale = 1f, pad = wc.paddingLeft, lift = wc.lift)
+                }
+                return try {
+                    val w = child.width; val h = child.height
+                    if (w == 0 || h == 0) return null
+                    val noGlass = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+                    com.oneuiclone.home.ui.GlassPaint.withOverride(null, 1f) { child.draw(android.graphics.Canvas(noGlass)) }
+                    val white = android.graphics.Bitmap.createBitmap(1, 1, android.graphics.Bitmap.Config.ARGB_8888).apply { eraseColor(android.graphics.Color.WHITE) }
+                    val withGlass = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+                    com.oneuiclone.home.ui.GlassPaint.withOverride(white, 1f) { child.draw(android.graphics.Canvas(withGlass)) }
+                    val n = w * h
+                    val p0 = IntArray(n); val p1 = IntArray(n)
+                    noGlass.getPixels(p0, 0, w, 0, 0, w, h)
+                    withGlass.getPixels(p1, 0, w, 0, 0, w, h)
+                    var anyGlass = false
+                    for (k in 0 until n) {
+                        val a0 = p0[k] ushr 24; val a1 = p1[k] ushr 24
+                        if (a1 > a0) { anyGlass = true; p1[k] = (a1 shl 24) or 0x00FFFFFF } else p1[k] = 0
+                    }
+                    val mask = if (anyGlass) android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888).apply {
+                        setPixels(p1, 0, w, 0, 0, w, h)
+                    } else null
+                    com.oneuiclone.home.widgets.WidgetManager.WidgetCapture(
+                        content = noGlass, glassMask = mask, hasGlass = anyGlass, pad = wc.paddingLeft, lift = wc.lift,
+                    )
+                } catch (e: Exception) {
+                    android.util.Log.w("OneUiHome", "widget capture failed", e)
+                    null
+                }
+            }
+        }
+        return null
     }
 
     /**
@@ -3480,6 +4026,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
 
     fun destroy() {
         if (live?.get() === this) live = null
+        try { activity.unregisterReceiver(unlockReceiver) } catch (_: Exception) {}
         android.app.WallpaperManager.getInstance(activity).removeOnColorsChangedListener(wallpaperColorsListener)
         com.oneuiclone.home.widgets.BubblesWidget.prefs(activity).unregisterOnSharedPreferenceChangeListener(bubblesListener)
         shortcutLoader.destroy()

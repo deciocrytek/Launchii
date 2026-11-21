@@ -50,7 +50,7 @@ class SetupActivity : OneUiPage() {
     companion object {
         private const val REQUEST_HOME_ROLE = 51
         private const val REQUEST_PHOTO = 52
-        private const val REQUEST_CONTACTS = 53
+        const val REQUEST_CONTACTS = 53
 
         /**
          * Set while the Home role dialog is up: granting it starts Home straight away (the permission controller
@@ -70,6 +70,26 @@ class SetupActivity : OneUiPage() {
         fun isHome(context: Context): Boolean {
             val roles = context.getSystemService(RoleManager::class.java)
             return roles.isRoleAvailable(RoleManager.ROLE_HOME) && roles.isRoleHeld(RoleManager.ROLE_HOME)
+        }
+
+        fun contactsAllowed(context: Context) =
+            context.checkSelfPermission(android.Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
+
+        /**
+         * The Contacts permission: the system dialog until it's been turned down for good, then the app's settings
+         * page (setup, and Settings › Search and Permissions & setup). The result comes back as [REQUEST_CONTACTS].
+         */
+        fun askContacts(activity: android.app.Activity) {
+            val permission = android.Manifest.permission.READ_CONTACTS
+            val sp = Prefs(activity).sp
+            if (!sp.getBoolean("asked_contacts", false) || activity.shouldShowRequestPermissionRationale(permission)) {
+                sp.edit().putBoolean("asked_contacts", true).apply()
+                activity.requestPermissions(arrayOf(permission), REQUEST_CONTACTS)
+            } else {
+                try {
+                    activity.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", activity.packageName, null)))
+                } catch (_: Exception) {}
+            }
         }
 
         /** Opens setup the first time only; true if it did. */
@@ -107,7 +127,7 @@ class SetupActivity : OneUiPage() {
                 open(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS, Uri.parse("package:$packageName")), Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
             },
             Step("Contacts", "Find people from search.", GLYPH_CONTACTS, 0xFF3E91FF.toInt(),
-                { checkSelfPermission(android.Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED }, "Allow") { askContacts() },
+                { contactsAllowed(this) }, "Allow") { askContacts() },
         )
     }
 
@@ -172,7 +192,7 @@ class SetupActivity : OneUiPage() {
         }
         bar.addView(TextView(this).apply {
             text = if (next == null) "Done" else "Continue"
-            setTextColor(Color.WHITE)
+            setTextColor(onPrimary)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
             typeface = Fonts.ui(this@SetupActivity, 600)
             gravity = Gravity.CENTER
@@ -231,7 +251,7 @@ class SetupActivity : OneUiPage() {
             typeface = Fonts.ui(this@SetupActivity, 600)
             gravity = Gravity.CENTER
             setPadding(dp(16f), 0, dp(16f), 0)
-            background = GradientDrawable().apply { cornerRadius = 100f * d; setColor(if (night) 0xFF1E2A3D.toInt() else 0xFFE3EEFF.toInt()) }
+            background = GradientDrawable().apply { cornerRadius = 100f * d; setColor(primarySoft) }
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34f)).apply { marginStart = dp(12f) }
             minWidth = dp(84f)
             isClickable = false
@@ -262,15 +282,7 @@ class SetupActivity : OneUiPage() {
     }
 
     /** The system dialog until it's been turned down for good, then the app's settings page. */
-    private fun askContacts() {
-        val permission = android.Manifest.permission.READ_CONTACTS
-        if (!prefs.sp.getBoolean("asked_contacts", false) || shouldShowRequestPermissionRationale(permission)) {
-            prefs.sp.edit().putBoolean("asked_contacts", true).apply()
-            requestPermissions(arrayOf(permission), REQUEST_CONTACTS)
-        } else {
-            open(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", packageName, null)), null)
-        }
-    }
+    private fun askContacts() = askContacts(this)
 
     private fun open(intent: Intent, fallback: Intent?) {
         try {
@@ -326,11 +338,11 @@ class SetupActivity : OneUiPage() {
     }
 }
 
-private const val GLYPH_HOME = "M10,20v-6h4v6h5v-8h3L12,3 2,12h3v8z"
-private const val GLYPH_WALLPAPER = "M21,19V5c0,-1.1 -0.9,-2 -2,-2H5c-1.1,0 -2,0.9 -2,2v14c0,1.1 0.9,2 2,2h14c1.1,0 2,-0.9 2,-2zM8.5,13.5l2.5,3.01L14.5,12l4.5,6H5l3.5,-4.5z"
-private const val GLYPH_BUBBLE = "M20,2H4c-1.1,0 -2,0.9 -2,2v18l4,-4h14c1.1,0 2,-0.9 2,-2V4c0,-1.1 -0.9,-2 -2,-2z"
+internal const val GLYPH_HOME = "M10,20v-6h4v6h5v-8h3L12,3 2,12h3v8z"
+internal const val GLYPH_WALLPAPER = "M21,19V5c0,-1.1 -0.9,-2 -2,-2H5c-1.1,0 -2,0.9 -2,2v14c0,1.1 0.9,2 2,2h14c1.1,0 2,-0.9 2,-2zM8.5,13.5l2.5,3.01L14.5,12l4.5,6H5l3.5,-4.5z"
+internal const val GLYPH_BUBBLE = "M20,2H4c-1.1,0 -2,0.9 -2,2v18l4,-4h14c1.1,0 2,-0.9 2,-2V4c0,-1.1 -0.9,-2 -2,-2z"
 /** An app tile with a badge dot nestled in its corner. */
-private const val GLYPH_BADGE = "M18.5,1.5a4,4 0,1 1,0 8a4,4 0,1 1,0 -8zM13,5H6c-1.1,0 -2,0.9 -2,2v11c0,1.1 0.9,2 2,2h11c1.1,0 2,-0.9 2,-2v-7A6,6 0,0 1,13 5z"
-private const val GLYPH_USAGE = "M5,9.2h3V19H5zM10.6,5h2.8v14h-2.8zM16.2,13H19v6h-2.8z"
-private const val GLYPH_CONTACTS = "M12,12c2.21,0 4,-1.79 4,-4s-1.79,-4 -4,-4 -4,1.79 -4,4 1.79,4 4,4zM12,14c-2.67,0 -8,1.34 -8,4v2h16v-2c0,-2.66 -5.33,-4 -8,-4z"
-private const val GLYPH_CHECK = "M9,16.17L4.83,12l-1.42,1.41L9,19 21,7l-1.41,-1.41z"
+internal const val GLYPH_BADGE = "M18.5,1.5a4,4 0,1 1,0 8a4,4 0,1 1,0 -8zM13,5H6c-1.1,0 -2,0.9 -2,2v11c0,1.1 0.9,2 2,2h11c1.1,0 2,-0.9 2,-2v-7A6,6 0,0 1,13 5z"
+internal const val GLYPH_USAGE = "M5,9.2h3V19H5zM10.6,5h2.8v14h-2.8zM16.2,13H19v6h-2.8z"
+internal const val GLYPH_CONTACTS = "M12,12c2.21,0 4,-1.79 4,-4s-1.79,-4 -4,-4 -4,1.79 -4,4 1.79,4 4,4zM12,14c-2.67,0 -8,1.34 -8,4v2h16v-2c0,-2.66 -5.33,-4 -8,-4z"
+internal const val GLYPH_CHECK = "M9,16.17L4.83,12l-1.42,1.41L9,19 21,7l-1.41,-1.41z"

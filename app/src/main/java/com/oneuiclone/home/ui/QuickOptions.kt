@@ -76,6 +76,11 @@ class QuickOptionPopup(
     var isDismissing = false; private set
     /** Touches outside the card dismiss it and fall through to what's below (widget resize handles). */
     var passThroughOutside = false
+    /** Rows the long-press finger can slide onto and let go ("glide"); the touch stays with the icon. */
+    private val glideTargets = ArrayList<View>()
+    private var glideHot: View? = null
+    /** The long-pressed icon, screen coords (set in [showFor]). */
+    private val anchorRect = Rect()
 
     init {
         clipChildren = false
@@ -107,6 +112,7 @@ class QuickOptionPopup(
             val info = GlyphView(context, QuickOption.INFO, fg).apply {
                 setOnClickListener { onAppInfo(); dismiss() }
             }
+            glideTargets += info
             titleRow.addView(info, LayoutParams(dp.dpi(32f), dp.dpi(30f), Gravity.END or Gravity.CENTER_VERTICAL).apply {
                 rightMargin = dp.dpi(10f)
             })
@@ -131,6 +137,7 @@ class QuickOptionPopup(
                         dismiss()
                     }
                 }
+                glideTargets += row
                 row.addView(BitmapIconView(context, icon), LinearLayout.LayoutParams(dp.dpi(26f), dp.dpi(26f)))
                 row.addView(TextView(context).apply {
                     text = sc.shortLabel
@@ -159,6 +166,7 @@ class QuickOptionPopup(
                     background = recoilBackground()
                     setOnClickListener { opt.action(); dismiss() }
                 }
+                glideTargets += item
                 item.addView(GlyphView(context, opt.glyph, fg), LinearLayout.LayoutParams(dp.dpi(19f), dp.dpi(19f)))
                 item.addView(TextView(context).apply {
                     text = opt.label
@@ -195,8 +203,67 @@ class QuickOptionPopup(
         android.content.res.ColorStateList.valueOf(if (night) 0x33FFFFFF else 0x1A000000), null,
         GradientDrawable().apply { cornerRadius = dp.dp(12f); setColor(0xFFFFFFFF.toInt()) })
 
+    // ---- glide: long-press an icon, slide onto a row, let go ----
+
+    /** Card bounds on screen at rest (ignores the 0.8→1 show scale). */
+    private fun cardOnScreen(out: RectF) {
+        val loc = IntArray(2); getLocationOnScreen(loc)
+        out.set(loc[0] + card.x, loc[1] + card.y, loc[0] + card.x + card.width, loc[1] + card.y + card.height)
+    }
+
+    /**
+     * Where a long-press finger at ([x], [y]) (screen coords) is: [ZONE_CARD] over the card, [ZONE_PATH] on the
+     * icon or the gap between it and the card (still undecided), else [ZONE_OUT] (the icon gets dragged).
+     */
+    fun glideZone(x: Float, y: Float, pad: Float): Int {
+        if (!shown || isDismissing || anchorRect.isEmpty) return ZONE_OUT
+        val c = RectF(); cardOnScreen(c)
+        if (c.contains(x, y)) return ZONE_CARD
+        val path = RectF(anchorRect)
+        path.union(anchorRect.exactCenterX(), if (c.centerY() < anchorRect.exactCenterY()) c.bottom else c.top)
+        path.inset(-pad, -pad)
+        return if (path.contains(x, y)) ZONE_PATH else ZONE_OUT
+    }
+
+    /** True if the card sits above the icon (the usual case), so "towards the card" means up. */
+    fun cardAbove(): Boolean { val c = RectF(); cardOnScreen(c); return c.centerY() < anchorRect.exactCenterY() }
+
+    /** Highlights the row under the finger (or none), with a tick when it changes. */
+    fun glideAt(x: Float, y: Float) {
+        if (isDismissing) return
+        val loc = IntArray(2)
+        val hit = glideTargets.firstOrNull { t ->
+            if (!t.isShown) return@firstOrNull false
+            t.getLocationOnScreen(loc)
+            x >= loc[0] && x < loc[0] + t.width && y >= loc[1] && y < loc[1] + t.height
+        }
+        if (hit !== glideHot) {
+            glideHot?.isPressed = false
+            glideHot = hit
+            if (hit != null) {
+                hit.getLocationOnScreen(loc)
+                hit.drawableHotspotChanged(x - loc[0], y - loc[1])
+                hit.isPressed = true
+                hit.performHapticFeedback(android.view.HapticFeedbackConstants.SEGMENT_TICK)
+            }
+        }
+    }
+
+    /** Finger lifted: runs the highlighted row. False if none was (the popup just stays open, as after a tap). */
+    fun glideRelease(): Boolean {
+        val hot = glideHot ?: return false
+        glideHot = null
+        hot.isPressed = false
+        if (isDismissing) return false
+        hot.performClick()
+        return true
+    }
+
+    fun glideCancel() { glideHot?.isPressed = false; glideHot = null }
+
     /** Position next to [anchor] (icon rect in screen coords) and animate in. */
     fun showFor(anchor: Rect, fromHotseat: Boolean) {
+        anchorRect.set(anchor)
         val cardLp = card.layoutParams as LayoutParams
         content.measure(MeasureSpec.makeMeasureSpec(cardLp.width, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED))
         val w = cardLp.width
@@ -272,6 +339,12 @@ class QuickOptionPopup(
             if (!r.contains(event.x, event.y)) { dismiss(); if (passThroughOutside) return false }
         }
         return true
+    }
+
+    companion object {
+        const val ZONE_OUT = 0
+        const val ZONE_PATH = 1
+        const val ZONE_CARD = 2
     }
 
     private class BitmapIconView(context: Context, private val bmp: Bitmap) : View(context) {

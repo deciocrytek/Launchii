@@ -346,6 +346,7 @@ class FolderController(
         if (p.isPopup) iconRect.set(restRect) else icon.iconBoundsOnScreen(iconRect)
         val tray = p.trayRect
         val srcSize = icon.iconSizePx()
+        val srcHeight = icon.iconHeightPx()
         // a wide pop-up card (3×2) shrinks by its height: its centred square is what becomes the icon
         // (Icons › Folder icons › Outside: the icon's plate is smaller than the icon)
         val startScale = srcSize * icon.plateScale / (if (p.isPopup) minOf(tray.width(), tray.height()) else tray.width()).toFloat()
@@ -366,29 +367,32 @@ class FolderController(
             icon.appShapes().apply {
                 val k = minOf(tray.width(), tray.height()) / (srcSize * icon.plateScale)
                 transform(android.graphics.Matrix().apply {
-                    setTranslate(-srcSize / 2f, -srcSize / 2f); postScale(k, k); postTranslate(tray.width() / 2f, tray.height() / 2f)
+                    setTranslate(-srcSize / 2f, -srcHeight / 2f); postScale(k, k); postTranslate(tray.width() / 2f, tray.height() / 2f)
                 })
             })
 
         // folder container bitmap that scales with the panel
         val bgCopy = FolderBgCopy(context, icon)
-        if (!popup) overlay.addView(bgCopy, FrameLayout.LayoutParams(srcSize, srcSize))
+        if (!popup) overlay.addView(bgCopy, FrameLayout.LayoutParams(srcSize, srcHeight))
         bgCopy.x = iconRect.left.toFloat(); bgCopy.y = iconRect.top.toFloat()
         bgCopy.pivotX = 0f; bgCopy.pivotY = 0f
 
         // flying preview icons
         val previewRect = RectF()
         // (Icons › Folder icons › Pixel: the four in the preview fly to their places; the rest come with the card)
-        val visible = (icon as? LargeFolderIconView)?.let { if (it.hasStack) 3 else 4 } ?: icon.previewSlots
+        val large = icon as? LargeFolderIconView
         val inFolder = p.gridIcons().filter { it !== p.placeholder }
-        (0 until minOf(visible, inFolder.size)).forEach { slot ->
-            // (Pixel's preview shows the folder's top-left 2×2, not its first four)
-            val target = inFolder.getOrNull(if (icon is LargeFolderIconView) slot else icon.rankInSlot(slot)) ?: return@forEach
+        val pageStart = large?.pageStartIndex ?: 0
+        val visible = if (large != null) minOf(LargeFolderIconView.PER_PAGE, (inFolder.size - pageStart).coerceAtLeast(0))
+            else minOf(icon.previewSlots, inFolder.size)
+        (0 until visible).forEach { slot ->
+            // (Pixel's preview shows the folder's top-left 2×2, not its first four; large folder flies its active page)
+            val target = inFolder.getOrNull(if (large != null) pageStart + slot else icon.rankInSlot(slot)) ?: return@forEach
             icon.childRect(slot, previewRect)
             previewRect.offset(iconRect.left.toFloat(), iconRect.top.toFloat())
             val to = RectF(p.iconRectInPanel(target))
-            // (with the see-through themes the closed folder shows the symbol alone: AppInfo.previewIcon)
-            val fly = FlyingIcon(context, target.icon, target.appInfo?.previewIcon)
+            // (with the see-through themes the closed 1×1 folder shows the symbol alone; large folders show full icons)
+            val fly = FlyingIcon(context, target.icon, if (large != null) null else target.appInfo?.previewIcon)
             overlay.addView(fly, FrameLayout.LayoutParams(dp.iconSizePx, dp.iconSizePx))
             fliers += Flier(fly, RectF(previewRect), to)
             target.iconVisible = false
@@ -433,8 +437,9 @@ class FolderController(
                     p.setReveal(e, tint)
                 } else p.alpha = e.coerceIn(0f, 1f)
                 // container bitmap: scales with the panel, fades over BG_FADE_DURATION after BG_FADE_DELAY (open) / 60 ms (close)
-                val bs = (tray.width() / srcSize.toFloat() - 1f) * e + 1f
-                bgCopy.scaleX = bs; bgCopy.scaleY = bs
+                val bsX = (tray.width() / srcSize.toFloat() - 1f) * e + 1f
+                val bsY = (tray.height() / srcHeight.toFloat() - 1f) * e + 1f
+                bgCopy.scaleX = bsX; bgCopy.scaleY = if (srcHeight == srcSize) bsX else bsY
                 bgCopy.x = iconRect.left + (tray.left - iconRect.left) * e
                 bgCopy.y = iconRect.top + (tray.top - iconRect.top) * e
                 bgCopy.moved()
@@ -546,6 +551,11 @@ class FolderController(
         private val path = android.graphics.Path()
         override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
             path.reset()
+            if (src is LargeFolderIconView) {
+                val r = src.paneRadiusPx
+                path.addRoundRect(0f, 0f, w.toFloat(), h.toFloat(), r, r, android.graphics.Path.Direction.CW)
+                return
+            }
             com.oneuiclone.home.icons.IconShape.path(w.toFloat(), com.oneuiclone.home.icons.IconShape.container).let { path.set(it) }
             // the icon's plate (smaller when its apps poke out)
             val s = src.plateScale

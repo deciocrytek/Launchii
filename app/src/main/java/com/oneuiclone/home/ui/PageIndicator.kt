@@ -78,6 +78,9 @@ class PageIndicator(context: Context, private val slotPx: Float, private val dot
 
     override fun onDraw(canvas: Canvas) {
         if (count <= 1) return
+        val overrideDark = if (GlassPaint.overrideActive) GlassPaint.overrideDarkText else null
+        val prevColor = paint.color
+        if (overrideDark != null) paint.color = if (overrideDark) 0xFF1D1D1F.toInt() else 0xFFFFFFFF.toInt()
         var x = dotsLeft() + slotPx / 2f
         val cy = height / 2f
         for (i in 0 until count) {
@@ -85,5 +88,6 @@ class PageIndicator(context: Context, private val slotPx: Float, private val dot
             canvas.drawCircle(x, cy, dotPx / 2f, paint)
             x += slotPx
         }
+        if (overrideDark != null) paint.color = prevColor
     }
 }
