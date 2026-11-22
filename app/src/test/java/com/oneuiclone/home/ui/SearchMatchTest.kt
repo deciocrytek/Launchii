@@ -1,6 +1,7 @@
 package com.oneuiclone.home.ui
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -116,5 +117,59 @@ class SearchAnswersTest {
         assertNull(SearchAnswers.setting("w"))
         assertNull(SearchAnswers.setting("spotify"))
         assertTrue(SearchAnswers.SETTINGS.all { it.actions.isNotEmpty() })
+    }
+    @Test fun mayBeApp() {
+        assertTrue(SearchAnswers.mayBeApp("strava"))
+        assertTrue(SearchAnswers.mayBeApp("Clash Royale"))
+        assertTrue(SearchAnswers.mayBeApp("Clash of Clans"))
+        assertTrue(SearchAnswers.mayBeApp("1.1.1.1"))
+        assertTrue(SearchAnswers.mayBeApp("Disney+"))
+        assertFalse(SearchAnswers.mayBeApp("what is ozenpic?"))
+        assertFalse(SearchAnswers.mayBeApp("what is ozempic"))
+        assertFalse(SearchAnswers.mayBeApp("weather tomorrow"))
+        assertFalse(SearchAnswers.mayBeApp("how to tie a tie"))
+        assertFalse(SearchAnswers.mayBeApp("2026"))
+        assertFalse(SearchAnswers.mayBeApp("ab"))
+    }
+    @Test fun suggestsApp() {
+        assertTrue(SearchAnswers.suggestsApp("strava", listOf("strava", "strava login", "strava app")))
+        assertTrue(SearchAnswers.suggestsApp("duolingo", listOf("duolingo", "duolingo apk")))
+        assertTrue(SearchAnswers.suggestsApp("spotify", listOf("spotify play store")))
+        assertFalse(SearchAnswers.suggestsApp("ozempic", listOf("ozempic", "ozempic side effects", "ozempic face")))
+        assertFalse(SearchAnswers.suggestsApp("what is ozenpic?", listOf("what is ozempic app")))
+        assertFalse(SearchAnswers.suggestsApp("whats", listOf("whatsapp")))
+        assertFalse(SearchAnswers.suggestsApp("apple", listOf("apple store", "apple pay")))
+    }
+    @Test fun parsePlayHero() {
+        val heroHtml = """
+            <div><a href="/store/apps/details?id=com.duolingo" aria-label="Duolingo: Learn &amp; Play" class="Qfxief"></a>
+            <div class="Y4A2mc"><img src="https://example.com/icon.png" alt="Icon image" itemprop="image" />
+            <div class="vWM94c">Duolingo: Learn &amp; Play</div></div></div>
+        """.trimIndent()
+        assertEquals(SearchAnswers.PlayApp("Duolingo: Learn & Play", "com.duolingo"), SearchAnswers.parsePlayHero(heroHtml))
+
+        val fallbackHtml = """
+            <a href="/store/apps/details?id=com.strava"></a>
+            <div class="vWM94c">Strava: Run, Bike &amp; Walk</div>
+        """.trimIndent()
+        assertEquals(SearchAnswers.PlayApp("Strava: Run, Bike & Walk", "com.strava"), SearchAnswers.parsePlayHero(fallbackHtml))
+
+        val listOnlyHtml = """
+            <a class="Si6A0c Gy4nib" href="/store/apps/details?id=com.example.ozempic">
+            <span class="DdYX5">GLP-1 Tracker: Ozempic</span></a>
+        """.trimIndent()
+        assertNull(SearchAnswers.parsePlayHero(listOnlyHtml))
+    }
+    @Test fun shouldEnableAutoCorrect() {
+        assertFalse(SearchAnswers.shouldEnableAutoCorrect(""))
+        assertFalse(SearchAnswers.shouldEnableAutoCorrect("strava"))
+        assertFalse(SearchAnswers.shouldEnableAutoCorrect("strava "))
+        assertFalse(SearchAnswers.shouldEnableAutoCorrect("clash royale"))
+        assertFalse(SearchAnswers.shouldEnableAutoCorrect("what"))
+        assertTrue(SearchAnswers.shouldEnableAutoCorrect("what "))
+        assertTrue(SearchAnswers.shouldEnableAutoCorrect("how "))
+        assertTrue(SearchAnswers.shouldEnableAutoCorrect("clash royale "))
+        assertTrue(SearchAnswers.shouldEnableAutoCorrect("best coffee "))
+        assertTrue(SearchAnswers.shouldEnableAutoCorrect("what is ozenpic"))
     }
 }

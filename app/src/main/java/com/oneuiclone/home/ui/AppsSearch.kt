@@ -25,6 +25,7 @@ import android.os.Looper
 import android.os.Build
 import android.os.SystemClock
 import android.text.Editable
+import android.text.InputType
 import android.text.TextWatcher
 import android.util.TypedValue
 import android.view.Gravity
@@ -139,8 +140,10 @@ class AppsSearch(
     private val glyph = MagnifierView(context, colors.hint)
     private val results = CellLayout(context, 4, 2)
     private val contactsBox = LinearLayout(context)
+    /** Play Store app card (0.286): sits above web results and never steals Enter/highlight from web search. */
+    private val playBox = LinearLayout(context)
     private val web = LinearLayout(context)
-    /** The answers row (0.230): a sum, a settings page or the Play Store, between the apps and Google. */
+    /** The answers row (0.230): a sum or settings page, right above the apps/bar. */
     private val answerBox = LinearLayout(context)
     /**
      * The contact "go" opens, as a row right above the bar (0.258): typing "erica" with no app match, Enter opened
@@ -165,6 +168,8 @@ class AppsSearch(
     private var picks = SearchSources.Picks(emptyMap(), emptyMap(), emptySet())
     private var answer: Answer? = null
     private var shownAnswer: String? = null
+    private var playAnswer: Answer? = null
+    private var shownPlayAnswer: String? = null
     /** What there is to show; [render] fits it above the bar. */
     private var appsList: List<AppInfo> = emptyList()
     private var contactsList: List<SearchSources.Contact> = emptyList()
@@ -384,7 +389,16 @@ class AppsSearch(
 
     private val main = Handler(Looper.getMainLooper())
     private val net = Executors.newSingleThreadExecutor { r -> Thread(r, "web-suggest") }
+    private val playNet = Executors.newSingleThreadExecutor { r -> Thread(r, "play-suggest") }
     private var pendingFetch: Runnable? = null
+    private var pendingPlay: Runnable? = null
+    private var pendingInputType: Runnable? = null
+    /** Keyboard autocorrect is off for 1–2 word app/contact queries and turns on once per longer web query (0.285). */
+    private var autoCorrectOn = false
+    /** Confirmed Play Store hero lookups for this search session (normalised query → app, or null if none). */
+    private val playCache = HashMap<String, SearchAnswers.PlayApp?>()
+    /** Normalised queries whose Google autocomplete suggestions pointed to an app ("<query> app", "apk", …). */
+    private val suggestApps = HashSet<String>()
 
     private val imeCallback = object : WindowInsetsAnimation.Callback(DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
         private fun WindowInsetsAnimation.isIme() = (typeMask and WindowInsets.Type.ime()) != 0
@@ -436,6 +450,7 @@ class AppsSearch(
             setTextColor(colors.text)
             setTextSize(TypedValue.COMPLEX_UNIT_PX, openTextSize)
             typeface = Fonts.ui(context, 400)
+            inputType = INPUT_PLAIN
             isSingleLine = true
             imeOptions = EditorInfo.IME_ACTION_GO or EditorInfo.IME_FLAG_NO_EXTRACT_UI
             setPadding(openTextStart.roundToInt(), 0, dp.dpi(16f), 0)
@@ -454,7 +469,7 @@ class AppsSearch(
         content.orientation = LinearLayout.VERTICAL
         content.gravity = Gravity.BOTTOM
         content.clipChildren = false
-        for (box in listOf(contactsBox, web, answerBox, contactRowBox)) {
+        for (box in listOf(contactsBox, playBox, web, answerBox, contactRowBox)) {
             box.orientation = LinearLayout.VERTICAL
             box.clipChildren = false
             content.addView(box, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
@@ -511,23 +526,56 @@ class AppsSearch(
         val query = normalize(q.trim())
         if (query.isEmpty()) {
             pendingFetch?.let { main.removeCallbacks(it) }
+            pendingPlay?.let { main.removeCallbacks(it) }
             pendingSources?.let { main.removeCallbacks(it) }
+            setAutoCorrect(false)
             appsList = mostUsed()
             contactsList = suggested
             webList = emptyList()
             answer = null
+            playAnswer = null
             render()
             return
         }
         appsList = matches(query)
         // until the new answers land: the typed query, and whatever of the last ones still fits it
         val raw = q.trim()
-        answer = findAnswer(raw, query, appsList)
+        answer = findAnswer(raw, query)
+        playAnswer = findPlayAnswer(raw, query, appsList, answer)
         webList = listOf(raw) + webList.drop(1).filter { it.startsWith(raw, ignoreCase = true) && !it.equals(raw, ignoreCase = true) }
         contactsList = (contactsList + seenContacts.values).distinctBy { it.id }.filter { c -> normalize(c.name).split(' ', '-', '.').any { it.startsWith(query) } }.take(SearchSources.MAX_MATCHES)
+        if (!autoCorrectOn && appsList.isEmpty() && contactsList.isEmpty() && SearchAnswers.shouldEnableAutoCorrect(q)) {
+            setAutoCorrect(true)
+        }
         render()
-        fetchSuggestions(raw)
+        fetchSuggestions(raw, query)
+        fetchPlayApp(raw, query)
         querySources(raw)
+    }
+
+    /**
+     * Switches between plain text (app/contact names) and autocorrect (multi-word web queries).
+     * Posted out of [TextWatcher.afterTextChanged] so [InputMethodManager.restartInput] never collides
+     * with the IME's active batch edit, while preserving cursor selection and typeface.
+     */
+    private fun setAutoCorrect(enabled: Boolean) {
+        if (enabled == autoCorrectOn) return
+        autoCorrectOn = enabled
+        pendingInputType?.let { main.removeCallbacks(it) }
+        val r = Runnable {
+            pendingInputType = null
+            if (!isOpen && enabled) return@Runnable
+            val want = if (autoCorrectOn) INPUT_AUTOCORRECT else INPUT_PLAIN
+            if (field.inputType == want) return@Runnable
+            val start = field.selectionStart
+            val end = field.selectionEnd
+            field.inputType = want
+            field.typeface = Fonts.ui(context, 400)
+            val len = field.length()
+            if (start >= 0 && end >= 0) field.setSelection(start.coerceIn(0, len), end.coerceIn(0, len))
+        }
+        pendingInputType = r
+        main.post(r)
     }
 
     /** The [MAX_APPS] most used apps that aren't on Home page 1 (topped up from the rest when there's little history). */
@@ -581,14 +629,16 @@ class AppsSearch(
             showContacts(if (invite) emptyList() else contactsList.take(rows * 2), invite && rows > 0, chip)
             showWeb(emptyList())
             showAnswer(null)
+            showPlayAnswer(null)
             showContactRow(null)
         } else {
             showAnswer(answer)
+            showPlayAnswer(playAnswer)
             // "go" opens the first contact when no app matched and there's no sum or settings answer: it gets a row
-            val pick = contactsList.firstOrNull()?.takeIf { !invite && appsList.isEmpty() && (answer?.id?.startsWith("play|") ?: true) }
+            val pick = contactsList.firstOrNull()?.takeIf { !invite && appsList.isEmpty() && answer == null }
             showContactRow(pick)
             val card = dp.dpi(ANSWER_DP) + 2 * dp.dpi(CARD_PAD_DP) + gap
-            val room = left - (if (answer != null) card else 0) - (if (pick != null) card else 0)
+            val room = left - (if (answer != null) card else 0) - (if (playAnswer != null) card else 0) - (if (pick != null) card else 0)
             val chip = dp.dpi(CHIP_DP)
             fun height(rows: Int) = if (rows == 0) 0 else rows * chip + (rows - 1) * chipGap + gap
             fun webFits(h: Int) = ((h - gap - 2 * dp.dpi(CARD_PAD_DP)) / dp.dpi(ROW_DP)).coerceIn(0, MAX_WEB)
@@ -633,17 +683,70 @@ class AppsSearch(
     // Google results
     // ---------------------------------------------------------------------------------------------
 
-    private fun fetchSuggestions(q: String) {
+    private fun fetchSuggestions(q: String, query: String) {
         pendingFetch?.let { main.removeCallbacks(it) }
         if (q.isEmpty() || !com.oneuiclone.home.settings.Prefs(context).webSuggestions) return
         val r = Runnable {
             net.execute {
+                if (!isOpen) return@execute
                 val list = try { suggest(q) } catch (_: Exception) { emptyList() }
-                main.post { if (isOpen && field.text.toString().trim() == q && list.isNotEmpty()) setWeb(q, list) }
+                main.post {
+                    if (!isOpen || field.text.toString().trim() != q || list.isEmpty()) return@post
+                    if (SearchAnswers.suggestsApp(query, list)) {
+                        suggestApps += query
+                        playAnswer = findPlayAnswer(q, query, appsList, answer)
+                    }
+                    setWeb(q, list)
+                }
             }
         }
         pendingFetch = r
         main.postDelayed(r, 150)
+    }
+
+    /**
+     * Checks Google Play for a featured hero app match for [raw] (only when no installed app, calc or setting
+     * matched and the query passes [SearchAnswers.mayBeApp]). Runs in parallel with Google autocomplete.
+     */
+    private fun fetchPlayApp(raw: String, query: String) {
+        pendingPlay?.let { main.removeCallbacks(it) }
+        if (appsList.isNotEmpty() || answer != null) return
+        if (!SearchAnswers.mayBeApp(raw, query) || query in playCache) return
+        if (!com.oneuiclone.home.settings.Prefs(context).webSuggestions || playIcon() == null) return
+        val r = Runnable {
+            playNet.execute {
+                if (!isOpen) return@execute
+                val (ok, hero) = try { true to playHero(raw) } catch (_: Exception) { false to null }
+                if (!ok) return@execute
+                main.post {
+                    playCache[query] = hero
+                    if (!isOpen || field.text.toString().trim() != raw) return@post
+                    val next = findPlayAnswer(raw, query, appsList, answer)
+                    if (next?.id != playAnswer?.id) {
+                        playAnswer = next
+                        render()
+                    }
+                }
+            }
+        }
+        pendingPlay = r
+        main.postDelayed(r, 200)
+    }
+
+    /** Fetches the Play Store apps search page and extracts its featured hero app, if any. */
+    private fun playHero(q: String): SearchAnswers.PlayApp? {
+        val lang = Locale.getDefault().toLanguageTag()
+        val url = URL("https://play.google.com/store/search?c=apps&hl=$lang&q=" + URLEncoder.encode(q, "UTF-8"))
+        val c = url.openConnection() as HttpURLConnection
+        c.connectTimeout = 2500; c.readTimeout = 2500
+        c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/130.0.0.0 Mobile Safari/537.36")
+        return try {
+            if (c.responseCode != HttpURLConnection.HTTP_OK) throw java.io.IOException("HTTP ${c.responseCode}")
+            val body = c.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            SearchAnswers.parsePlayHero(body)
+        } finally {
+            c.disconnect()
+        }
     }
 
     /** Google's public autocomplete endpoint: `["query", ["suggestion", …]]`. */
@@ -701,8 +804,12 @@ class AppsSearch(
     private val answerIcons = HashMap<String, Drawable?>()
     private val settingIntents = HashMap<String, Intent?>()
 
-    /** A sum or conversion first, then a settings page, then (no app matched) the Play Store. */
-    private fun findAnswer(raw: String, query: String, apps: List<AppInfo>): Answer? {
+    private fun playIcon(): Drawable? = answerIcons.getOrPut("play") {
+        try { context.packageManager.getApplicationIcon(PLAY_STORE) } catch (_: Exception) { null }
+    }
+
+    /** Instant local answers: a sum or conversion first, then a settings page. */
+    private fun findAnswer(raw: String, query: String): Answer? {
         SearchAnswers.calc(raw)?.let { c ->
             return Answer("calc|${c.value}|${c.shown}", c.value, "${c.shown} · Tap to copy", calculatorIcon(), "=") { copy(c.value) }
         }
@@ -714,11 +821,23 @@ class AppsSearch(
                 try { context.packageManager.resolveActivity(intent, 0)?.loadIcon(context.packageManager) } catch (_: Exception) { null }
             }, null) { v -> onOpenIntent(v, Intent(intent)) }
         }
-        if (apps.isEmpty() && query.length >= 3) {
-            val play = answerIcons.getOrPut("play") {
-                try { context.packageManager.getApplicationIcon(PLAY_STORE) } catch (_: Exception) { null }
+        return null
+    }
+
+    /**
+     * Play Store card (shown above web results, never taking over Enter): only when no installed app or local answer
+     * matched and the query is confirmed as an app by Play Store's hero match or Google autocomplete ("<query> app").
+     */
+    private fun findPlayAnswer(raw: String, query: String, apps: List<AppInfo>, localAnswer: Answer?): Answer? {
+        if (apps.isNotEmpty() || localAnswer != null || !SearchAnswers.mayBeApp(raw, query)) return null
+        val play = playIcon() ?: return null
+        playCache[query]?.let { hero ->
+            return Answer("play|pkg|${hero.pkg}", hero.title, "Play Store", play, null) { v ->
+                onOpenIntent(v, Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=" + Uri.encode(hero.pkg))).setPackage(PLAY_STORE))
             }
-            if (play != null) return Answer("play|$raw", raw, "Look it up in the Play Store", play, null) { v ->
+        }
+        if (query in suggestApps) {
+            return Answer("play|q|$raw", raw, "Look it up in the Play Store", play, null) { v ->
                 onOpenIntent(v, Intent(Intent.ACTION_VIEW, Uri.parse("market://search?q=" + Uri.encode(raw) + "&c=apps")).setPackage(PLAY_STORE))
             }
         }
@@ -743,8 +862,21 @@ class AppsSearch(
     private fun showAnswer(a: Answer?) {
         if (a?.id == shownAnswer) return
         shownAnswer = a?.id
-        answerBox.removeAllViews()
-        answerBox.visibility = if (a == null) GONE else VISIBLE
+        renderAnswerCard(answerBox, a, enterable = true, fade = true)
+    }
+
+    /** Play Store card above web results: rebuilt only when it changes; never takes over the Enter highlight. */
+    private fun showPlayAnswer(a: Answer?) {
+        val prev = shownPlayAnswer
+        if (a?.id == prev) return
+        shownPlayAnswer = a?.id
+        // upgrading a generic Play Store row to the matched app updates in place without fading out and back in
+        renderAnswerCard(playBox, a, enterable = false, fade = prev == null)
+    }
+
+    private fun renderAnswerCard(box: LinearLayout, a: Answer?, enterable: Boolean, fade: Boolean) {
+        box.removeAllViews()
+        box.visibility = if (a == null) GONE else VISIBLE
         if (a == null) return
         val card = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
@@ -760,10 +892,10 @@ class AppsSearch(
             typeface = Fonts.ui(context, 600)
             background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(0xFFEA8600.toInt()) }
         }
-        card.addView(row(leading, 36f, a.title, a.subtitle, true) { a.run(it) },
+        card.addView(row(leading, 36f, a.title, a.subtitle, enterable) { a.run(it) },
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp.dpi(ANSWER_DP)))
-        answerBox.addView(card)
-        reveal(card)
+        box.addView(card)
+        if (fade) reveal(card)
     }
 
     /** [c]'s row above the bar, in the answer row's card, rebuilt (and faded in) only when the contact changes. */
@@ -974,16 +1106,16 @@ class AppsSearch(
     }
 
     /**
-     * Nothing is highlighted before a query is typed: "go" has nothing to open then. The Play Store answer is only a
-     * fallback for "no app matched", so a matching contact goes first ("kyle" opens Kyle, not a Play Store search).
+     * Nothing is highlighted before a query is typed: "go" has nothing to open then. Priority: first installed app,
+     * else promoted contact row, else instant local answer (sum/settings), else contact chip, else Google web search.
+     * Play Store ([playBox]) never steals focus or Enter.
      */
     private fun updateEnterTarget() {
-        val playAnswer = shownAnswer?.startsWith("play|") == true
         val target = if (field.text.isNullOrBlank()) null
             else (results.getChildAt(0) as? IconView)
                 ?: firstEnterable(contactRowBox)
-                ?: (if (playAnswer) firstEnterable(contactsBox) ?: firstEnterable(answerBox)
-                    else firstEnterable(answerBox) ?: firstEnterable(contactsBox))
+                ?: firstEnterable(answerBox)
+                ?: firstEnterable(contactsBox)
                 ?: firstEnterable(web)
         // the contact row's chip up top is highlighted with it (rebuilt chips need it again even when the row stays)
         val twin = if (target != null && contactRowBox.visibility == VISIBLE && target === firstEnterable(contactRowBox))
@@ -1289,8 +1421,12 @@ class AppsSearch(
         main.removeCallbacks(settled)
         main.removeCallbacks(riseFallback)
         pendingFetch?.let { main.removeCallbacks(it) }
+        pendingPlay?.let { main.removeCallbacks(it) }
+        pendingInputType?.let { main.removeCallbacks(it) }
         pendingSources?.let { main.removeCallbacks(it) }
+        autoCorrectOn = false
         net.shutdownNow()
+        playNet.shutdownNow()
         context.getSystemService(InputMethodManager::class.java)?.hideSoftInputFromWindow(field.windowToken, 0)
         field.isCursorVisible = false
     }
@@ -1581,6 +1717,8 @@ class AppsSearch(
         /** The answers row's height. */
         private const val ANSWER_DP = 60f
         private const val PLAY_STORE = "com.android.vending"
+        private const val INPUT_PLAIN = InputType.TYPE_CLASS_TEXT
+        private const val INPUT_AUTOCORRECT = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_AUTO_CORRECT
         /** A keyboard this still (ms) under the search field is a settled one, whose height can be learned. */
         private const val SETTLE_MS = 350L
         /** Opening by tap: how long the bar waits for the keyboard before it rises without it (an app's hands over in ~400 ms). */

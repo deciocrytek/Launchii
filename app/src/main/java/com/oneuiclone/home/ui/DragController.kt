@@ -93,6 +93,8 @@ class DragController(
     private var dragView: DragView? = null
     private var pickupAnim: ValueAnimator? = null
     private var removeBar: RemoveBar? = null
+    /** Blurred wallpaper for the frosted Remove circle. */
+    var glass: WidgetGlass? = null
     private var source: IconView? = null
     private var item: HomeItem? = null
     private var app: AppInfo? = null
@@ -166,10 +168,9 @@ class DragController(
         })
 
         if (item != null && !fromApps) {
-            val rb = RemoveBar(context, dp)
-            overlay.addView(rb, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, rb.barHeight))
-            rb.alpha = 0f
-            rb.animate().alpha(1f).setDuration(150).start()
+            val rb = RemoveBar(context, dp, glass)
+            overlay.addView(rb, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, rb.viewHeight))
+            rb.enter()
             removeBar = rb
         }
         if (folder == null) animateBackground(1f, 150)                   // (in a folder: the folder's background)
@@ -192,10 +193,9 @@ class DragController(
         dragView = dv
         src.alpha = 0f
         dv.animate().scaleX(1.04f).scaleY(1.04f).setDuration(150).setInterpolator(Easing.BASIC).start()
-        val rb = RemoveBar(context, dp)
-        overlay.addView(rb, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, rb.barHeight))
-        rb.alpha = 0f
-        rb.animate().alpha(1f).setDuration(150).start()
+        val rb = RemoveBar(context, dp, glass)
+        overlay.addView(rb, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, rb.viewHeight))
+        rb.enter()
         removeBar = rb
         animateBackground(1f, 150)
         updateGuides(currentTarget())
@@ -231,7 +231,7 @@ class DragController(
         if (removing) {
             endReorder(revert = true)
             m.items.remove(w); deleteWidget(w); m.save()
-            dv.animate().scaleX(0f).scaleY(0f).alpha(0f).setDuration(200).withEndAction { overlay.removeView(dv) }.start()
+            absorb(dv)
             dragView = null; widgetSource = null
             rebind(); cleanup(); return
         }
@@ -322,7 +322,12 @@ class DragController(
         touchX = x; touchY = y
         position()
         val dp = dpProvider()
-        removeBar?.setActive(y < (removeBar?.barHeight ?: 0))
+        removeBar?.let { rb ->
+            val was = rb.active
+            rb.setActive(y < rb.barHeight)
+            rb.focusX = x
+            if (rb.active != was) dragView?.animateDanger(if (rb.active) 1f else 0f)
+        }
         folderDrag?.let { fd ->
             hideGuides()
             if (removeBar?.active == true || fd.isInside(x, y)) {
@@ -593,7 +598,7 @@ class DragController(
         val m = model()
         val dv = dragView
         val removing = removeBar?.active == true && item != null
-        removeBar?.let { rb -> rb.animate().alpha(0f).setDuration(150).withEndAction { overlay.removeView(rb) }.start() }
+        removeBar?.let { rb -> if (removing) rb.postDelayed({ rb.exit { overlay.removeView(rb) } }, 140) else rb.exit { overlay.removeView(rb) } }
         removeBar = null
         val fd = folderDrag
         folderDrag = null
@@ -613,7 +618,7 @@ class DragController(
             if (fromFolder >= 0) dissolveIfNeeded(m, fromFolder)
             m.save()
             if (fromFolder < 0) onRemoved?.invoke(item!!)
-            dv.animate().scaleX(0f).scaleY(0f).alpha(0f).setDuration(200).withEndAction { overlay.removeView(dv) }.start()
+            absorb(dv)
             dragView = null
             rebind(); cleanup(); return
         }
@@ -847,7 +852,7 @@ class DragController(
         hoverTarget?.let { animateFolderBg(it, 1f) }; hoverTarget = null
         dragView?.let { overlay.removeView(it) }; dragView = null
         widgetSource?.alpha = 1f; widgetSource = null
-        removeBar?.let { overlay.removeView(it) }; removeBar = null
+        removeBar?.let { it.showStatusBar(); overlay.removeView(it) }; removeBar = null
         // still in the folder: it stays open, with its background
         folderDrag?.cancel() ?: animateBackground(0f, 150)
         folderDrag = null
@@ -974,6 +979,13 @@ class DragController(
         return cl.cellH / 2f
     }
 
+    /** A removed item rises into the red at the top edge, shrinking away (0.291). */
+    private fun absorb(dv: DragView) {
+        dv.animate().y(dv.y - dpProvider().dp(48f)).scaleX(.12f).scaleY(.12f).alpha(0f).setDuration(260)
+            .setInterpolator(android.view.animation.PathInterpolator(.4f, 0f, .85f, .3f))
+            .withEndAction { overlay.removeView(dv) }.start()
+    }
+
     private fun cleanup() {
         source?.let { it.iconVisible = true; it.labelAlpha = 1f }
         source = null; item = null; app = null
@@ -998,35 +1010,193 @@ class DragController(
                 start()
             }
         }
+        /** 0..1 red tint while held over Remove (0.289; Neon's crimson at 42 %, shrinking to 0.86, 0.291). */
+        var danger = 0f
+            set(v) { field = v; invalidate() }
+        private var dangerAnim: ValueAnimator? = null
+        fun animateDanger(to: Float) {
+            dangerAnim?.cancel()
+            dangerAnim = ValueAnimator.ofFloat(danger, to).apply {
+                duration = 160; interpolator = Easing.BASIC
+                addUpdateListener { danger = it.animatedValue as Float }
+                start()
+            }
+        }
+        private val dangerP = Paint().apply { xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.SRC_ATOP) }
         override fun onDraw(canvas: Canvas) {
+            val tinted = danger > 0f
+            if (tinted) canvas.saveLayer(0f, 0f, width.toFloat(), height.toFloat(), null)
             canvas.save()
-            canvas.scale(hover, hover, width / 2f, height / 2f)
+            val ds = 1f - 0.14f * danger
+            canvas.scale(hover * ds, hover * ds, width / 2f, height / 2f)
             if (live != null) live.draw(canvas)
             else bmp?.let { if (shaped != null) shaped.draw(canvas, it, Rect(0, 0, width, height), p) else canvas.drawBitmap(it, null, Rect(0, 0, width, height), p) }
             canvas.restore()
+            if (tinted) {
+                dangerP.color = ((0x6B * danger).toInt() shl 24) or 0xE00E1A
+                canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), dangerP)
+                canvas.restore()
+            }
         }
     }
 
-    /** CancelDropTargetBar: "Remove" target at the top (drop_target_height_ratio_in_page_top 6.9 %). */
-    private class RemoveBar(context: Context, dp: DeviceProfile) : FrameLayout(context) {
-        val barHeight = (dp.heightPx * 0.069f).toInt() + dp.insets.top
+    /**
+     * The Remove target (0.291, round 3 "Crimson Tide" with Claude's roll-down): no button. For the drag the status
+     * bar slides away and a soft coral-red fade rolls down from the top edge over a little frost, gone by the date
+     * widget. With an item over it the fade deepens into a bold crimson that reaches further down, with a gently
+     * pulsing glow above the finger, and the phone ticks once. Dropping above [barHeight] removes the item.
+     */
+    private class RemoveBar(context: Context, private val dp: DeviceProfile, private val glass: WidgetGlass?) : View(context) {
+        /** Over this line the item is removed: as in 0.290, clear of the first row's middle. */
+        val barHeight = dp.insets.top + dp.dpi(44f)
+        private val restDepth = dp.widthPx * 0.276f
+        private val armedDepth = dp.widthPx * 0.449f
+        private val frostRest = dp.widthPx * 0.267f
+        private val frostArmed = dp.widthPx * 0.334f
+        /** Room for the armed depth and its overshoot. */
+        val viewHeight = (armedDepth * 1.15f).toInt()
         var active = false; private set
-        private val label = TextView(context).apply {
-            text = "Remove"
-            setTextColor(0xFFFAFAFA.toInt())
-            textSize = 15f
-            typeface = Fonts.ui(context, 600)
-            gravity = Gravity.CENTER
-            setShadowLayer(dp.dp(2f), 0f, 0f, 0x59000000)
+        /** Where the glow sits: the finger's x. */
+        var focusX = dp.widthPx / 2f
+            set(v) { if (field != v) { field = v; if (active) invalidate() } }
+        /** 0 = idle, 1 = an item is over the target (overshoots a little on arming). */
+        private var t = 0f
+        private var anim: ValueAnimator? = null
+        /** 0 = rolled up out of sight, 1 = rolled down. */
+        private var drop = 0f
+        private var dropAnim: ValueAnimator? = null
+        /** The glow's slow, soft pulse while armed (turned down from the mockup's). */
+        private var pulse = 0f
+        private var pulseAnim: ValueAnimator? = null
+        private var statusHidden = false
+        private val glassPaint = GlassPaint()
+        private val drawnAt = android.graphics.Matrix()
+        private val frostMask = Paint().apply { xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.DST_IN) }
+        private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val m = android.graphics.Matrix()
+
+        override fun onAttachedToWindow() { super.onAttachedToWindow(); glass?.views?.add(this) }
+        override fun onDetachedFromWindow() {
+            showStatusBar()
+            pulseAnim?.cancel()
+            glass?.views?.remove(this)
+            super.onDetachedFromWindow()
         }
-        init {
-            addView(label, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT).apply { topMargin = dp.insets.top })
+
+        private fun hideStatusBar() {
+            val c = windowInsetsController ?: return
+            c.systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            c.hide(android.view.WindowInsets.Type.statusBars())
+            statusHidden = true
         }
+        fun showStatusBar() {
+            if (!statusHidden) return
+            statusHidden = false
+            windowInsetsController?.show(android.view.WindowInsets.Type.statusBars())
+        }
+
+        /** The status bar leaves and the red rolls down from the top. */
+        fun enter() {
+            hideStatusBar()
+            animateDrop(1f, 460, android.view.animation.PathInterpolator(.2f, .8f, .2f, 1f), null)
+        }
+        /** Rolls back up, the status bar returns, then [end]. */
+        fun exit(end: () -> Unit) {
+            showStatusBar()
+            animateDrop(0f, 240, android.view.animation.AccelerateInterpolator(1.4f), end)
+        }
+        private fun animateDrop(to: Float, ms: Long, interp: android.animation.TimeInterpolator, end: (() -> Unit)?) {
+            dropAnim?.cancel()
+            dropAnim = ValueAnimator.ofFloat(drop, to).apply {
+                duration = ms; interpolator = interp
+                addUpdateListener { drop = it.animatedValue as Float; invalidate() }
+                if (end != null) addListener(object : AnimatorListenerAdapter() { override fun onAnimationEnd(a: Animator) { end() } })
+                start()
+            }
+        }
+
         fun setActive(a: Boolean) {
             if (a == active) return
             active = a
-            label.setTextColor(if (a) 0xFFFF6B6B.toInt() else 0xFFFAFAFA.toInt())
-            label.animate().scaleX(if (a) 1.08f else 1f).scaleY(if (a) 1.08f else 1f).setDuration(150).start()
+            if (a) performHapticFeedback(HapticFeedbackConstants.GESTURE_THRESHOLD_ACTIVATE)
+            anim?.cancel()
+            anim = ValueAnimator.ofFloat(t, if (a) 1f else 0f).apply {
+                duration = if (a) 340 else 200
+                interpolator = if (a) android.view.animation.PathInterpolator(.34f, 1.4f, .64f, 1f) else Easing.BASIC
+                addUpdateListener { t = it.animatedValue as Float; invalidate() }
+                start()
+            }
+            pulseAnim?.cancel(); pulseAnim = null
+            if (a) pulseAnim = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 1400; repeatCount = ValueAnimator.INFINITE; repeatMode = ValueAnimator.REVERSE
+                interpolator = android.view.animation.AccelerateDecelerateInterpolator()
+                addUpdateListener { pulse = it.animatedValue as Float; invalidate() }
+                start()
+            } else pulse = 0f
+        }
+
+        private fun argb(a: Float, r: Int, g: Int, b: Int) = ((a.coerceIn(0f, 1f) * 255).toInt() shl 24) or (r shl 16) or (g shl 8) or b
+
+        private fun vertical(depth: Float, alpha: Float, colors: IntArray, stops: FloatArray) {
+            val cs = IntArray(colors.size) { i ->
+                val c = colors[i]
+                argb(((c ushr 24) / 255f) * alpha, (c shr 16) and 0xFF, (c shr 8) and 0xFF, c and 0xFF)
+            }
+            fill.shader = android.graphics.LinearGradient(0f, 0f, 0f, depth, cs, stops, android.graphics.Shader.TileMode.CLAMP)
+        }
+
+        /** An ellipse [rx]×[ry] from ([cx], 0), as a radial gradient squashed vertically. */
+        private fun ellipse(canvas: Canvas, cx: Float, rx: Float, ry: Float, alpha: Float, colors: IntArray, stops: FloatArray) {
+            if (alpha <= 0f || rx <= 0f || ry <= 0f) return
+            val cs = IntArray(colors.size) { i ->
+                val c = colors[i]
+                argb(((c ushr 24) / 255f) * alpha, (c shr 16) and 0xFF, (c shr 8) and 0xFF, c and 0xFF)
+            }
+            val g = android.graphics.RadialGradient(cx, 0f, rx, cs, stops, android.graphics.Shader.TileMode.CLAMP)
+            m.setScale(1f, ry / rx, cx, 0f); g.setLocalMatrix(m)
+            fill.shader = g
+            canvas.drawRect(0f, 0f, width.toFloat(), ry, fill)
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            val d = drop.coerceIn(0f, 1f)
+            if (d <= 0f) return
+            val k = t.coerceAtLeast(0f)
+            val ka = t.coerceIn(0f, 1f)
+            val w = width.toFloat()
+            val depth = (restDepth + (armedDepth - restDepth) * k) * d     // rolls down from the top edge
+            val frost = (frostRest + (frostArmed - frostRest) * k) * d
+            // a little frost: the blurred wallpaper, fading out well before the date widget's text
+            if (frost > 1f) {
+                drawnAt.reset(); transformMatrixToGlobal(drawnAt)
+                if (glassPaint.aim(glass, drawnAt)) {
+                    val save = canvas.saveLayer(0f, 0f, w, frost, null)
+                    canvas.drawRect(0f, 0f, w, frost, glassPaint.paint)
+                    frostMask.shader = android.graphics.LinearGradient(0f, 0f, 0f, frost,
+                        intArrayOf(0xFF000000.toInt(), 0x9E000000.toInt(), 0x29000000, 0), floatArrayOf(0f, .52f, .81f, .96f),
+                        android.graphics.Shader.TileMode.CLAMP)
+                    canvas.drawRect(0f, 0f, w, frost, frostMask)
+                    canvas.restoreToCount(save)
+                }
+            }
+            if (depth < 1f) return
+            // at rest: a soft coral-red fade (it fades to 15 % as the crimson takes over)
+            val rest = 1f - .85f * ka
+            vertical(depth, rest, intArrayOf(argb(.48f, 255, 62, 56), argb(.29f, 255, 70, 64), argb(.12f, 255, 76, 70), argb(.03f, 255, 76, 70), 0),
+                floatArrayOf(0f, .24f, .52f, .78f, 1f))
+            canvas.drawRect(0f, 0f, w, depth, fill)
+            ellipse(canvas, w / 2f, w * .92f, depth * .78f, rest, intArrayOf(argb(.24f, 255, 74, 68), argb(.10f, 255, 68, 64), 0),
+                floatArrayOf(0f, .44f, .84f))
+            if (ka <= 0f) return
+            // armed: a deep crimson tide, a darker rim at the very edge, and a softly pulsing glow above the finger
+            vertical(depth, ka, intArrayOf(argb(.97f, 178, 4, 18), argb(.90f, 210, 10, 24), argb(.62f, 206, 14, 26),
+                argb(.29f, 182, 12, 24), argb(.08f, 158, 8, 20), 0), floatArrayOf(0f, .20f, .44f, .68f, .86f, 1f))
+            canvas.drawRect(0f, 0f, w, depth, fill)
+            val ps = 1f + .03f * pulse
+            ellipse(canvas, focusX, w * .78f * ps, depth * .92f * ps, ka * (1f - .12f * pulse),
+                intArrayOf(argb(.68f, 242, 16, 28), argb(.42f, 222, 12, 24), argb(.15f, 195, 8, 20), 0), floatArrayOf(0f, .38f, .68f, .94f))
+            vertical(depth, ka, intArrayOf(argb(.42f, 140, 0, 12), argb(.16f, 195, 8, 22), 0), floatArrayOf(0f, .14f, .30f))
+            canvas.drawRect(0f, 0f, w, depth * .3f, fill)
         }
     }
 }

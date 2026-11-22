@@ -93,6 +93,35 @@ class TouchRipple(private val samsungPxScale: Float) {
         }
     }
 
+    /**
+     * A scroll took the touch over: no bounce plays while the list moves. Items that already moved ease straight
+     * back to rest over [ms] (no overshoot); ones whose delay hadn't run out never move. [snap] goes straight back
+     * (a folder about to open out of it measures where it rests).
+     */
+    fun settle(ms: Long = 120L, snap: View? = null) {
+        val back = ArrayList<Entry>()
+        for (e in active) {
+            e.anim.cancel()
+            val v = e.view
+            if (v === snap) { v.translationX = e.baseX; v.translationY = e.baseY; continue }
+            val fromX = v.translationX; val fromY = v.translationY
+            if (fromX == e.baseX && fromY == e.baseY) continue
+            val anim = ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = ms
+                interpolator = Easing.CUBIC_OUT
+                addUpdateListener {
+                    val f = it.animatedValue as Float
+                    v.translationX = fromX + (e.baseX - fromX) * f
+                    v.translationY = fromY + (e.baseY - fromY) * f
+                }
+            }
+            back += Entry(v, anim, e.baseX, e.baseY)    // a new press's reset() cancels these and restores rest
+            anim.start()
+        }
+        active.clear()
+        active += back
+    }
+
     /** One-shot "release" wave from a point (app returning to its icon): out and back. */
     fun pulse(views: List<View>, tx: Float, ty: Float) {
         start(views, tx, ty)

@@ -298,7 +298,7 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
                 folders.openForDrop(view, folder, its.mapNotNull { r.get(it.key) } + app, its + dragged)
             }
         },
-    )
+    ).also { it.glass = widgetGlass }
     private var popup: com.oneuiclone.home.ui.QuickOptionPopup? = null
     // ---- Undo after a removal (0.263, design opinion 2) ----
     private var undoPill: com.oneuiclone.home.ui.UndoPill? = null
@@ -514,7 +514,8 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
         homeLayer.clipChildren = false
         appsLayer.clipChildren = false
         root.setOnApplyWindowInsetsListener { _, wi ->
-            val sb = wi.getInsets(android.view.WindowInsets.Type.systemBars())
+            // ignoring visibility: the status bar hides during a drag (Remove, 0.291) and Home mustn't move
+            val sb = wi.getInsetsIgnoringVisibility(android.view.WindowInsets.Type.systemBars())
             val r = Rect(sb.left, sb.top, sb.right, sb.bottom)
             if (r != insets) {
                 insets = r
@@ -1359,7 +1360,10 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
                 setOnClickListener {
                     val i = hitApp(lastTouchX, lastTouchY)
                     if (i >= 0) launch(this, content[i], slotFor(i))
-                    else folders.open(this, item, content, model!!.appsInFolder(item.id).filter { r.get(it.key) != null })
+                    else {
+                        ripple.settle(snap = this)            // a tap opens the folder: no press bounce behind it
+                        folders.open(this, item, content, model!!.appsInFolder(item.id).filter { r.get(it.key) != null })
+                    }
                 }
                 attachItem(this, item, null, false) { homeSiblings() }
             }
@@ -1374,6 +1378,9 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
                 applyFolderStyle(this, item)
                 setOnClickListener {
                     val its = model!!.appsInFolder(item.id).filter { r.get(it.key) != null }
+                    // a tap opens the folder: the press bounce stops (Home eases still behind the pop-up) and the
+                    // card comes out of the icon where it rests, which is also where the close lands
+                    ripple.settle(snap = this)
                     folders.open(this, item, its.mapNotNull { r.get(it.key) }, its)
                 }
                 attachItem(this, item, null, false) { homeSiblings() }
@@ -1471,6 +1478,9 @@ class Launcher(val activity: LauncherActivity) : AppRepository.Listener {
                     }
                     val wasDragging = drag.isDragging
                     if (wasDragging) { drag.drop(); folders.finishDetached() }
+                    // Apps list: the touch turned into a scroll (or a pull back to Home), so the press bounce
+                    // stops and the icons ease back instead of bouncing while the list moves
+                    if (fromApps && !wasDragging && ev.actionMasked == MotionEvent.ACTION_CANCEL) ripple.settle()
                     dragArmed = null
                     if (wasDragging) return@setOnTouchListener true
                 }

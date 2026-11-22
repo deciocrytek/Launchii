@@ -16,6 +16,9 @@ object SearchAnswers {
     /** A settings page: [actions] are tried in order until one opens (panels first, then the page itself). */
     data class Setting(val title: String, val place: String, val keywords: List<String>, val actions: List<String>)
 
+    /** An app confirmed on Google Play (its featured hero match for a search query). */
+    data class PlayApp(val title: String, val pkg: String)
+
     // ---------------------------------------------------------------------------------------------
     // maths
     // ---------------------------------------------------------------------------------------------
@@ -233,5 +236,112 @@ object SearchAnswers {
             }
         }
         return best
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Play Store app detection (0.284)
+    // ---------------------------------------------------------------------------------------------
+
+    private val NON_APP_PUNCT = Regex("[?!,;\"()]")
+    private val PURE_NUMBER = Regex("^[\\d\\s\\-/]+$")
+    private val AUTOCORRECT_STARTERS = setOf(
+        "what", "whats", "what's", "who", "whos", "who's", "where", "wheres", "where's",
+        "when", "whens", "when's", "why", "whys", "why's", "how", "hows", "how's",
+    )
+    private val QUESTION_STARTERS = AUTOCORRECT_STARTERS + setOf(
+        "is", "are", "was", "were", "can", "could", "should", "would", "do", "does", "did", "will",
+        "define", "meaning", "translate", "weather", "price", "cost", "best", "near", "nearest",
+    )
+    private val HERO_ANCHOR = Regex("""<a\s+href="/store/apps/details\?id=([A-Za-z0-9._]+)"\s+aria-label="([^"]+)"[^>]*></a>""")
+    private val HERO_TITLE = Regex("""class="vWM94c">([^<]+)<""")
+    private val DETAILS_HREF = Regex("""href="/store/apps/details\?id=([A-Za-z0-9._]+)"""")
+    private val HTML_NUM_ENTITY = Regex("&#(x?[0-9a-fA-F]+);")
+
+    /**
+     * Fast local filter: whether [raw] (normalised as [query]) could plausibly be an app name (short, no
+     * question/sentence punctuation, not a multi-word question or general lookup phrase).
+     */
+    fun mayBeApp(raw: String, query: String = SearchMatch.normalize(raw)): Boolean {
+        if (query.length < 3 || query.length > 40) return false
+        if (NON_APP_PUNCT.containsMatchIn(raw)) return false
+        if (PURE_NUMBER.matches(query)) return false
+        val words = query.split(' ').filter { it.isNotEmpty() }
+        if (words.isEmpty() || words.size > 3) return false
+        if (words.size >= 2 && words[0] in QUESTION_STARTERS) return false
+        return true
+    }
+
+    /**
+     * Whether keyboard autocorrect should turn on for raw input [raw] (assuming no installed app or contact matches):
+     * once the user finishes 2 words (space into word 3, or 3+ words via swipe/paste), or right after a 1-word
+     * question starter ("what ", "how ", "why ", "where ", "when ", "who ").
+     */
+    fun shouldEnableAutoCorrect(raw: String): Boolean {
+        if (raw.isBlank()) return false
+        val trailingSpace = raw.last().isWhitespace()
+        val words = SearchMatch.normalize(raw).split(' ').filter { it.isNotEmpty() }
+        if (words.size >= 3) return true
+        if (trailingSpace && words.size >= 2) return true
+        if (trailingSpace && words.size == 1 && words[0] in AUTOCORRECT_STARTERS) return true
+        return false
+    }
+
+    /**
+     * True when Google autocomplete [suggestions] for [query] (normalised) indicate the user is looking for an app
+     * (e.g. "strava app", "duolingo apk", "spotify play store").
+     */
+    fun suggestsApp(query: String, suggestions: List<String>): Boolean {
+        val q = SearchMatch.normalize(query)
+        if (!mayBeApp(q, q)) return false
+        return suggestions.any { raw ->
+            val s = SearchMatch.normalize(raw)
+            if (!s.startsWith(q)) return@any false
+            val rest = s.removePrefix(q)
+            if (!rest.startsWith(" ")) return@any false
+            val after = rest.trimStart()
+            after == "app" || after.startsWith("app ") ||
+                after == "apk" || after.startsWith("apk ") ||
+                after == "mobile app" || after.startsWith("mobile app ") ||
+                after == "play store" || after.startsWith("play store ") ||
+                after == "google play" || after.startsWith("google play ") ||
+                after == "android app" || after.startsWith("android app ")
+        }
+    }
+
+    /**
+     * Extracts the featured top-match app (hero card) from a Google Play Store search HTML page, if present.
+     * Play Store only renders this hero card when the query strongly matches a specific app, not for generic queries.
+     */
+    fun parsePlayHero(html: String): PlayApp? {
+        for (m in HERO_ANCHOR.findAll(html)) {
+            val end = (m.range.last + 900).coerceAtMost(html.length)
+            val tail = html.substring(m.range.last + 1, end)
+            if ("itemprop=\"image\"" in tail || "class=\"vWM94c\"" in tail) {
+                val pkg = m.groupValues[1]
+                val title = unescapeHtml(m.groupValues[2]).trim()
+                if (pkg.isNotEmpty() && title.isNotEmpty()) return PlayApp(title, pkg)
+            }
+        }
+        val titleMatch = HERO_TITLE.find(html) ?: return null
+        val start = (titleMatch.range.first - 1200).coerceAtLeast(0)
+        val head = html.substring(start, titleMatch.range.first)
+        val pkg = DETAILS_HREF.findAll(head).lastOrNull()?.groupValues?.get(1) ?: return null
+        val title = unescapeHtml(titleMatch.groupValues[1]).trim()
+        return if (title.isNotEmpty()) PlayApp(title, pkg) else null
+    }
+
+    private fun unescapeHtml(s: String): String {
+        if ('&' !in s) return s
+        val decoded = HTML_NUM_ENTITY.replace(s) { m ->
+            val raw = m.groupValues[1]
+            val code = if (raw.startsWith("x", ignoreCase = true)) raw.drop(1).toIntOrNull(16) else raw.toIntOrNull()
+            if (code != null && code in 1..0x10FFFF) String(Character.toChars(code)) else m.value
+        }
+        return decoded
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
     }
 }

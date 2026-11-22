@@ -47,6 +47,18 @@ class IconFactory(private val context: Context) {
         /** Instagram, drawn as its crisp white camera glyph in Clear Colour ([drawInstagramGlyph]) so it doesn't wash out on glass. */
         private val INSTAGRAM = setOf("com.instagram.android", "com.instagram.lite")
         /**
+         * Pixel / AOSP Camera, drawn as a high-contrast satin graphite camera body with white ring and Google Blue
+         * optical lens in Clear Colour ([drawCameraGlyph], option 1 of mockups/camera-frosted-colour-3.html) because
+         * its pale-grey body over a pale-grey background otherwise gets keyed out by [clearGlyph].
+         */
+        private val CAMERA = setOf(
+            "com.google.android.GoogleCamera",
+            "com.google.android.GoogleCameraGood",
+            "com.google.android.GoogleCameraEng",
+            "com.android.camera",
+            "com.android.camera2",
+        )
+        /**
          * Clear Colour: apps whose plate-coloured parts inside the symbol stay filled ([fillEnclosed]) rather than cut
          * out to glass, as the date on Calendar's page (user, 0.254: its "31" went see-through). YT Music's ring and
          * WhatsApp's handset are still cut.
@@ -242,6 +254,12 @@ class IconFactory(private val context: Context) {
         private const val CLEAR_RP_SHARE = 0.35f
         private const val CLEAR_FROST_INFILL = 0.78f
         private const val CLEAR_RP_BEVEL = 0.34f
+        /**
+         * Clear Colour / Minimal Colour: solid black symbols (T3, X, Threads) lift to this off-black floor (#1A1A1A,
+         * mockup A of mockups/solid-black-dark-gray.html) so they soften on glass without altering lighter dark
+         * charcoal icons like GitHub (#1F2328) or dark details inside colourful icons (Waze, Monopoly GO).
+         */
+        private const val CLEAR_BLACK_FLOOR = 0x1A
         /** iOS Dark's plate, top to foot (measured), and its overall colour for the Zoom In card. */
         private const val IOS_DARK_TOP = 0xFF333333.toInt()
         private const val IOS_DARK_BOTTOM = 0xFF101010.toInt()
@@ -1224,6 +1242,7 @@ class IconFactory(private val context: Context) {
             applyEmboss(c, size)
             return clip(layers, size)
         }
+        liftSolidBlack(glyph)
         clearSheen(glyph)
         softShadow(c, glyph, size, CLEAR_SHADOW)
         symbolEdge(c, glyph, size)
@@ -1309,6 +1328,41 @@ class IconFactory(private val context: Context) {
             fun ch(fc: Int, bc: Int) = ((fc * fa + bc * ba) / a).roundToInt().coerceIn(0, 255)
             px[i] = Color.argb((a * 255).roundToInt(), ch(Color.red(f), Color.red(b)), ch(Color.green(f), Color.green(b)), ch(Color.blue(f), Color.blue(b)))
         }
+    }
+
+    /**
+     * Softens solid black Clear Colour / Minimal Colour symbols (T3, X, Threads) to [CLEAR_BLACK_FLOOR] (#1A1A1A):
+     * gated on [darkShare] so colourful icons with dark details (Waze's eyes, Monopoly GO) stay untouched, and floored
+     * per channel so icons already lighter than #1A1A1A (GitHub #1F2328) are left alone.
+     */
+    private fun liftSolidBlack(glyph: Bitmap) {
+        val box = opaqueBounds(glyph)
+        if (box.isEmpty) return
+        val share = smooth(0.55f, 0.85f, darkShare(glyph, box))
+        if (share <= 0f) return
+        val w = box.width()
+        val h = box.height()
+        val px = IntArray(w * h)
+        glyph.getPixels(px, 0, w, box.left, box.top, w, h)
+        var changed = false
+        for (i in px.indices) {
+            val p = px[i]
+            val a = p ushr 24
+            if (a == 0) continue
+            val neutral = 1f - smooth(0.10f, 0.22f, chroma(p))
+            val k = share * neutral
+            if (k <= 0f) continue
+            val r = Color.red(p)
+            val g = Color.green(p)
+            val b = Color.blue(p)
+            if (r >= CLEAR_BLACK_FLOOR && g >= CLEAR_BLACK_FLOOR && b >= CLEAR_BLACK_FLOOR) continue
+            val nr = r + ((max(r, CLEAR_BLACK_FLOOR) - r) * k).roundToInt()
+            val ng = g + ((max(g, CLEAR_BLACK_FLOOR) - g) * k).roundToInt()
+            val nb = b + ((max(b, CLEAR_BLACK_FLOOR) - b) * k).roundToInt()
+            px[i] = (a shl 24) or (nr shl 16) or (ng shl 8) or nb
+            changed = true
+        }
+        if (changed) glyph.setPixels(px, 0, w, box.left, box.top, w, h)
     }
 
     /**
@@ -1538,6 +1592,7 @@ class IconFactory(private val context: Context) {
             ownIcon(Canvas(layers), src, size)
             return clip(layers, size)
         }
+        liftSolidBlack(glyph)
         clearSheen(glyph)
         return minimal(glyph, size, edge)
     }
@@ -1576,6 +1631,10 @@ class IconFactory(private val context: Context) {
         }
         if (pkg in INSTAGRAM) {
             drawInstagramGlyph(g, s / 2f, s / 2f, s * CLEAR_INSTAGRAM_SIZE)
+            return glyph
+        }
+        if (pkg in CAMERA) {
+            drawCameraGlyph(g, s)
             return glyph
         }
         val d = src as? AdaptiveIconDrawable
@@ -1966,6 +2025,101 @@ class IconFactory(private val context: Context) {
             style = Paint.Style.FILL
             this.color = color
         })
+    }
+
+    /**
+     * Pixel Camera's Graphite Body glyph for Clear Colour (option 1 of mockups/camera-frosted-colour-3.html): satin
+     * dark graphite camera silhouette (#464B56 → #24272E) with subtle top bevel, silver flash dot, crisp white lens
+     * ring, and Google Blue optical lens with upper-left catchlight. Coordinates are in 100ths of [s].
+     */
+    private fun drawCameraGlyph(c: Canvas, s: Float) {
+        val k = s / 100f
+        val cx = 50f * k
+        val cy = 52f * k
+
+        // G1-continuous camera silhouette (rounded body + smoothly filleted viewfinder hump)
+        val body = Path().apply {
+            moveTo(40.5f * k, 17.5f * k)
+            lineTo(59.5f * k, 17.5f * k)
+            quadTo(62.5f * k, 17.5f * k, 64.1f * k, 20.3f * k)
+            lineTo(66.4f * k, 24.4f * k)
+            quadTo(67.6f * k, 26.5f * k, 70.2f * k, 26.5f * k)
+            lineTo(74.0f * k, 26.5f * k)
+            arcTo(RectF(63.5f * k, 26.5f * k, 84.5f * k, 47.5f * k), -90f, 90f)
+            arcTo(RectF(63.5f * k, 56.5f * k, 84.5f * k, 77.5f * k), 0f, 90f)
+            arcTo(RectF(15.5f * k, 56.5f * k, 36.5f * k, 77.5f * k), 90f, 90f)
+            arcTo(RectF(15.5f * k, 26.5f * k, 36.5f * k, 47.5f * k), 180f, 90f)
+            lineTo(29.8f * k, 26.5f * k)
+            quadTo(32.4f * k, 26.5f * k, 33.6f * k, 24.4f * k)
+            lineTo(35.9f * k, 20.3f * k)
+            quadTo(37.5f * k, 17.5f * k, 40.5f * k, 17.5f * k)
+            close()
+        }
+
+        val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        // Satin dark graphite fill
+        p.shader = android.graphics.LinearGradient(
+            0f, 17.5f * k, 0f, 77.5f * k,
+            0xFF464B56.toInt(), 0xFF24272E.toInt(), Shader.TileMode.CLAMP
+        )
+        c.drawPath(body, p)
+
+        // Subtle sculpted top inner bevel along upward-facing contours
+        if (iconShine) {
+            c.save()
+            c.clipPath(body)
+            c.drawPath(body, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.STROKE
+                strokeWidth = 2.2f * k
+                shader = android.graphics.LinearGradient(
+                    0f, 17.5f * k, 0f, 44f * k,
+                    0x48FFFFFF, 0x00FFFFFF, Shader.TileMode.CLAMP
+                )
+            })
+            c.restore()
+        }
+
+        // Subtle anodized-silver flash indicator dot
+        p.shader = null
+        p.color = 0xA5C3CAD4.toInt()
+        c.drawCircle(73.2f * k, 35.8f * k, 2.3f * k, p)
+
+        // Soft recessed shadow under the white lens ring
+        c.drawCircle(cx, cy + 0.9f * k, 18.4f * k, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0x58000000
+            maskFilter = blur(1.4f * k)
+        })
+
+        // Crisp white lens ring
+        p.shader = android.graphics.LinearGradient(
+            0f, 33f * k, 0f, 71f * k,
+            0xFFFFFFFF.toInt(), 0xFFECF0F6.toInt(), Shader.TileMode.CLAMP
+        )
+        c.drawCircle(cx, cy, 18.2f * k, p)
+
+        // Subtle deep-blue inner rim framing the lens
+        p.shader = null
+        p.color = 0xFF163E94.toInt()
+        c.drawCircle(cx, cy, 13.7f * k, p)
+
+        // Vivid Google Blue optical lens
+        p.shader = android.graphics.LinearGradient(
+            0f, 38f * k, 0f, 66f * k,
+            0xFF5898FC.toInt(), 0xFF2668E0.toInt(), Shader.TileMode.CLAMP
+        )
+        c.drawCircle(cx, cy, 13.2f * k, p)
+
+        // Delicate upper-left optical glass catchlight
+        c.save()
+        c.clipPath(Path().apply { addCircle(cx, cy, 13.2f * k, Path.Direction.CW) })
+        p.shader = android.graphics.RadialGradient(
+            cx - 3.6f * k, cy - 3.8f * k, 6.8f * k,
+            intArrayOf(0x58FFFFFF, 0x18FFFFFF, 0x00FFFFFF),
+            floatArrayOf(0f, 0.55f, 1f),
+            Shader.TileMode.CLAMP
+        )
+        c.drawCircle(cx, cy, 13.2f * k, p)
+        c.restore()
     }
 
     /**
